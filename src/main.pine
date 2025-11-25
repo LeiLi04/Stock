@@ -1,0 +1,500 @@
+//@version=6
+indicator("ChanLun Pro Strict v15", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+import ./libraries/ChanLunLib as cl
+import ./libraries/DrawingLib as dl
+
+// ==============================
+// 1. 设置菜单 (Settings)
+// ==============================
+grpA = "1. 缠论结构 (Structure)"
+lrb = input.int(1, "分型左右K数", minval=1, group=grpA)
+minBarsStroke = input.int(4, "成笔最小跨度", minval=1, group=grpA)
+useNorm = input.bool(true, "启用K线包含处理", group=grpA)
+minStrokesPerSeg = input.int(3, "线段最少包含笔数", minval=3, group=grpA)
+
+grpDisp = "2. 显示开关 (Display)"
+showInclusion   = input.bool(false, "显示包含处理K线", group=grpDisp)
+showStrokeLines = input.bool(true,  "显示 笔 (Strokes)", group=grpDisp)
+showSegLines    = input.bool(true,  "显示 线段 (Segments)", group=grpDisp)
+segLineWidth    = input.int(2,      "线段线宽", minval=1, maxval=10, group=grpDisp)
+showCenter      = input.bool(true,  "显示 中枢 (Centers)", group=grpDisp)
+showCenterLabels= input.bool(true,  "显示 中枢数值", group=grpDisp)
+showSignalLabels= input.bool(true,  "显示 信号标签", group=grpDisp)
+
+grpEnh = "4. 信号过滤"
+use_gaussian_filter = input.bool(true, "启用高斯通道过滤 (C1)", group=grpEnh)
+gauss_len = input.int(20, "高斯周期", group=grpEnh)
+gauss_mult = input.float(2.0, "高斯带宽", step=0.1, group=grpEnh)
+show_gaussian_bands = input.bool(false, "显示高斯通道", group=grpEnh)
+macd_use_segment = input.bool(true, "C1 使用线段级背驰", group=grpEnh)
+
+grpCol = "5. 颜色风格"
+col_stroke_up = input.color(color.lime, "上涨笔", group=grpCol)
+col_stroke_dn = input.color(color.red, "下跌笔", group=grpCol)
+col_seg_up    = input.color(color.blue, "上涨线段", group=grpCol)
+col_seg_dn    = input.color(color.blue, "下跌线段", group=grpCol)
+col_center_bg = input.color(color.new(color.orange, 80), "中枢填充", group=grpCol)
+col_text      = input.color(color.white, "文字颜色", group=grpCol)
+col_label_buy = input.color(color.lime, "买点颜色", group=grpCol)
+col_label_sell= input.color(color.red, "卖点颜色", group=grpCol)
+
+grpInd = "3. 辅助指标"
+showMA   = input.bool(false, "启用均线系统", group=grpInd)
+ma1_len  = input.int(5, "MA 1", group=grpInd, inline="ma1")
+show_ma1 = input.bool(true, "", group=grpInd, inline="ma1")
+ma2_len  = input.int(10, "MA 2", group=grpInd, inline="ma2")
+show_ma2 = input.bool(true, "", group=grpInd, inline="ma2")
+ma3_len  = input.int(20, "MA 3", group=grpInd, inline="ma3")
+show_ma3 = input.bool(true, "", group=grpInd, inline="ma3")
+ma4_len  = input.int(30, "MA 4", group=grpInd, inline="ma4")
+show_ma4 = input.bool(true, "", group=grpInd, inline="ma4")
+ma5_len  = input.int(60, "MA 5", group=grpInd, inline="ma5")
+show_ma5 = input.bool(true, "", group=grpInd, inline="ma5")
+
+showBB   = input.bool(false, "启用布林带", group=grpInd)
+bb_len   = input.int(20, "布林周期", group=grpInd)
+bb_mult  = input.float(2.0, "布林带宽", group=grpInd)
+
+useNeonCandles = input.bool(false, "强制覆盖K线颜色", group=grpCol)
+col_candle_up = input.color(color.lime, "涨K线", group=grpCol)
+col_candle_dn = input.color(color.red, "跌K线", group=grpCol)
+
+// ==============================
+// 2. 初始化 (Init)
+// ==============================
+var gc = dl.GCManager.new()
+if barstate.isfirst
+    gc.init(400)
+
+var strokes = array.new<cl.Stroke>()
+var centerSt = cl.CenterState.new(false, na, na, na, na, 0, 0, 0)
+var segSt = cl.SegState.new(false, na, na, 0, na, na, na, na, na, 0)
+
+// ==============================
+// 3. 预处理 (Preprocessing)
+// ==============================
+[macd, signal, hist] = ta.macd(close, 12, 26, 9)
+
+// Gaussian
+basis = ta.ema(close, gauss_len)
+volatility = ta.ema(ta.tr(true), gauss_len)
+upper_bound = basis + (gauss_mult * volatility)
+lower_bound = basis - (gauss_mult * volatility)
+if show_gaussian_bands
+    p1 = plot(upper_bound, "Upper", color=color.red)
+    p2 = plot(lower_bound, "Lower", color=color.green)
+    fill(p1, p2, color=color.new(color.gray, 95))
+
+// MA & BB
+plot(showMA and show_ma1 ? ta.sma(close, ma1_len) : na, "MA1", color=color.yellow)
+plot(showMA and show_ma2 ? ta.sma(close, ma2_len) : na, "MA2", color=color.white)
+plot(showMA and show_ma3 ? ta.sma(close, ma3_len) : na, "MA3", color=color.aqua)
+plot(showMA and show_ma4 ? ta.sma(close, ma4_len) : na, "MA4", color=color.orange)
+plot(showMA and show_ma5 ? ta.sma(close, ma5_len) : na, "MA5", color=color.red, linewidth=2)
+
+[bb_mid, bb_upper, bb_lower] = ta.bb(close, bb_len, bb_mult)
+plot(showBB ? bb_upper : na, "BB Upper", color=color.new(color.blue, 80))
+plot(showBB ? bb_lower : na, "BB Lower", color=color.new(color.blue, 80))
+plot(showBB ? bb_mid : na, "BB Mid", color=color.new(color.orange, 80))
+
+// Neon Candles
+barcolor(useNeonCandles ? (close >= open ? col_candle_up : col_candle_dn) : na)
+
+// Inclusion (K线包含)
+var float nHigh = na, var float nLow = na, var int nDir = 0
+if na(nHigh)
+    nHigh := high, nLow := low, nDir := close >= open ? 1 : -1
+else
+    contain_prev = high <= nz(nHigh[1]) and low >= nz(nLow[1])
+    contain_rev = high[1] <= high and low[1] >= low
+    _ndir = nDir != 0 ? nDir : (close >= close[1] ? 1 : -1)
+    if useNorm and (contain_prev or contain_rev)
+        if _ndir >= 0 
+            nHigh := math.max(nz(nHigh[1], high), high)
+            nLow := math.max(nz(nLow[1], low), low)
+        else          
+            nHigh := math.min(nz(nHigh[1], high), high)
+            nLow := math.min(nz(nLow[1], low), low)
+    else
+        nHigh := high, nLow := low, nDir := close >= close[1] ? 1 : -1
+
+plot(showInclusion ? nHigh : na, color=color.new(color.aqua, 50), title="NormHigh")
+plot(showInclusion ? nLow : na, color=color.new(color.fuchsia, 50), title="NormLow")
+
+// ==============================
+// 4. 笔生成 (Stroke Generation)
+// ==============================
+srcH = useNorm ? nHigh : high
+srcL = useNorm ? nLow : low
+ph = ta.pivothigh(srcH, lrb, lrb)
+pl = ta.pivotlow(srcL, lrb, lrb)
+
+var int lastPivotIndex = na
+var float lastPivotPrice = na
+var int lastPivotType = 0 // 0:None, 1:High, 2:Low
+
+makeStroke(_hasPivot, _isHigh, _idx, _price) =>
+    bool created = false
+    int curType = _isHigh ? 1 : 2
+    
+    if not na(lastPivotIndex) and lastPivotType != 0 and curType != lastPivotType
+        distBars = _idx - lastPivotIndex
+        if distBars >= minBarsStroke
+            // Valid Stroke
+            dir = _isHigh ? 1 : -1
+            histVal = cl.get_val_at_bar(hist, _idx)
+            
+            s = cl.createStroke(lastPivotIndex, lastPivotPrice, _idx, _price, dir, histVal)
+            strokes.push(s)
+            
+            if showStrokeLines
+                gc.drawLine(lastPivotIndex, lastPivotPrice, _idx, _price, xloc.bar_index, dir>0?col_stroke_up:col_stroke_dn, 2)
+            
+            created := true
+            lastPivotIndex := _idx
+            lastPivotPrice := _price
+            lastPivotType := curType
+    else if na(lastPivotIndex) or lastPivotType == 0
+        // First Pivot
+        lastPivotIndex := _idx
+        lastPivotPrice := _price
+        lastPivotType := curType
+    else
+        // Extension (Update Pivot if better)
+        if (_isHigh and _price > lastPivotPrice) or (not _isHigh and _price < lastPivotPrice)
+            lastPivotIndex := _idx
+            lastPivotPrice := _price
+
+    created
+
+bool evPH = not na(ph)
+bool evPL = not na(pl)
+int phIdx = evPH ? bar_index - lrb : na
+int plIdx = evPL ? bar_index - lrb : na
+
+if evPH and evPL
+    if lastPivotType == 2 // Last was Low, expect High
+        evPL := false
+    else if lastPivotType == 1
+        evPH := false
+
+bool madePH = false
+bool madePL = false
+
+if evPH
+    madePH := makeStroke(true, true, phIdx, ph)
+if evPL
+    madePL := makeStroke(true, false, plIdx, pl)
+
+var centers = array.new<cl.CenterState>()
+
+// ==============================
+// 5. 中枢 & 线段 (Centers & Segments)
+// ==============================
+if madePH or madePL
+    // Update Centers
+    int cStatus = centerSt.update(strokes)
+    
+    // Draw Center Box
+    if centerSt.inCenter
+        // Logic to draw/update box
+        if showCenter
+            sStart = strokes.get(centerSt.startStr)
+            sEnd = strokes.get(centerSt.lastStr)
+            txt = showCenterLabels ? "ZG:" + str.tostring(centerSt.zg, "#.##") + "\nZD:" + str.tostring(centerSt.zd, "#.##") : ""
+            gc.drawBox(sStart.startIdx, centerSt.zg, sEnd.endIdx, centerSt.zd, xloc.bar_index, color.new(col_center_bg, 50), col_center_bg, txt, col_text)
+    
+    if cStatus == 3 // Finished
+        centers.push(centerSt.copy())
+
+    // Update Segments
+    if segSt.update(strokes, minStrokesPerSeg)
+        na
+
+    // Live Segment Drawing (Seamless)
+    var line liveSeg = line.new(na, na, na, na, width=segLineWidth)
+    if showSegLines and segSt.inProgress
+        sStart = strokes.get(segSt.startStr)
+        sEnd = strokes.get(segSt.lastStr) // Connect to latest stroke tip
+        
+        // Update live line
+        line.set_xy1(liveSeg, sStart.endIdx, sStart.endPx) // Start from previous segment end
+        // Note: For seamless, we should ideally track the exact end point of the previous segment.
+        // But sStart.endIdx is the end of the first stroke of the new segment? 
+        // No, sStart is the stroke at `startStr`.
+        // If `startStr` is the peak of the previous segment, then `sStart.endPx` (or startPx depending on dir) is the peak.
+        // Let's assume sStart.endIdx is close enough for now.
+        
+        line.set_xy1(liveSeg, sStart.startIdx, sStart.startPx)
+        line.set_xy2(liveSeg, sEnd.endIdx, sEnd.endPx)
+        line.set_color(liveSeg, segSt.dir > 0 ? col_seg_up : col_seg_dn)
+    else
+        line.set_xy1(liveSeg, na, na)
+        line.set_xy2(liveSeg, na, na)
+
+// ==============================
+// 6. 信号 (Signals)
+// ==============================
+var bool c1Buy = false
+var bool c1Sell = false
+var float c1BuyPx = na
+var float c1SellPx = na
+var bool c2BuyTrig = false
+var bool c2SellTrig = false
+var bool c3Buy = false
+var bool c3Sell = false
+
+if strokes.size() >= 2 and (madePH or madePL)
+    curS = strokes.get(strokes.size() - 1)
+    
+    // C1 Logic (Trend Reversal)
+    // ... (Already implemented)
+    // Buy: Down Stroke, New Low, MACD Divergence, Gaussian Filter
+    if curS.dir == -1
+        l0 = curS.get_low()
+        // Check Divergence
+        isDiv = false
+        // Simple Stroke Divergence
+        if strokes.size() >= 3
+            prevDownS = strokes.get(strokes.size() - 3)
+            if l0 < prevDownS.get_low() and curS.macdHist > prevDownS.macdHist
+                isDiv := true
+        
+        // Gaussian Filter
+        isGauss = not use_gaussian_filter or (l0 <= cl.get_val_at_bar(lower_bound, curS.endIdx))
+        
+        if isDiv and isGauss
+            c1Buy := true
+            c1BuyPx := l0
+            c2BuyTrig := false
+            if showSignalLabels
+                gc.drawLabel(curS.endIdx, l0, "C1 Buy", col_label_buy, label.style_label_up, col_text)
+
+    // Sell: Up Stroke, New High, MACD Divergence, Gaussian Filter
+    if curS.dir == 1
+        h0 = curS.get_high()
+        isDiv = false
+        if strokes.size() >= 3
+            prevUpS = strokes.get(strokes.size() - 3)
+            if h0 > prevUpS.get_high() and curS.macdHist < prevUpS.macdHist
+                isDiv := true
+        
+        isGauss = not use_gaussian_filter or (h0 >= cl.get_val_at_bar(upper_bound, curS.endIdx))
+        
+        if isDiv and isGauss
+            c1Sell := true
+            c1SellPx := h0
+            c2SellTrig := false
+            if showSignalLabels
+                gc.drawLabel(curS.endIdx, h0, "C1 Sell", col_label_sell, label.style_label_down, col_text)
+
+// C2 Logic (Second Confirmation)
+// ------------------------------
+if c1Buy and not c2BuyTrig and strokes.size() > 0
+    lastS = strokes.get(strokes.size() - 1)
+    // Wait for a Down stroke that doesn't break C1 Low
+    if lastS.dir == -1
+        if lastS.get_low() > c1BuyPx
+            c2BuyTrig := true
+            c1Buy := false // Reset C1 state
+            if showSignalLabels
+                gc.drawLabel(lastS.endIdx, lastS.endPx, "C2 Buy", col_label_buy, label.style_label_up, col_text)
+
+if c1Sell and not c2SellTrig and strokes.size() > 0
+    lastS = strokes.get(strokes.size() - 1)
+    if lastS.dir == 1
+        if lastS.get_high() < c1SellPx
+            c2SellTrig := true
+            c1Sell := false
+            if showSignalLabels
+                gc.drawLabel(lastS.endIdx, lastS.endPx, "C2 Sell", col_label_sell, label.style_label_down, col_text)
+
+// C3 Logic (Trend Explosion)
+// --------------------------
+if strokes.size() > 0 and centers.size() > 0
+    lastS = strokes.get(strokes.size() - 1)
+    lastC = centers.get(centers.size() - 1)
+    
+    // C3 Buy: Rising Center (ori=1) + Pullback Low >= ZG
+    // We need to ensure we just left the center and pulled back.
+    // The center finished at `lastC.lastStr`.
+    // The stroke leaving the center is `lastC.lastStr + 1` (or `lastC.exitDir` stroke).
+    // The pullback stroke is `lastC.lastStr + 2`.
+    // So we check if `strokes.size() - 1` is the pullback stroke.
+    
+    // Check if last center was Up (Rising)
+    if lastC.ori == 1
+        // We need a pullback (Down stroke)
+        if lastS.dir == -1
+            // Check if this stroke is the first pullback after center?
+            // Center ended at `lastC.lastStr`. 
+            // Stroke `lastC.lastStr` was part of center.
+            // Stroke `lastC.lastStr + 1` was the exit stroke (Up).
+            // Stroke `lastC.lastStr + 2` is the pullback stroke (Down).
+            // So index should be `lastC.lastStr + 2`.
+            
+            // However, `lastC.lastStr` is an index in `strokes`.
+            // If `strokes.size() - 1 == lastC.lastStr + 2`
+            if (strokes.size() - 1) == (lastC.lastStr + 2)
+                // Check if Pullback Low >= ZG (Strong) or ZD (Standard)?
+                // Whitepaper: "Low for Buy ... 绝对不触及中枢边界 (ZG/ZD)"
+                // Usually C3 Buy means Low > ZG (High of Center).
+                if lastS.get_low() > lastC.zg
+                    c3Buy := true
+                    if showSignalLabels
+                        gc.drawLabel(lastS.endIdx, lastS.endPx, "C3 Buy", col_label_buy, label.style_label_up, col_text)
+
+    // C3 Sell: Falling Center (ori=-1) + Pullback High <= ZD
+    if lastC.ori == -1
+        // We need a pullback (Up stroke)
+        if lastS.dir == 1
+            if (strokes.size() - 1) == (lastC.lastStr + 2)
+                if lastS.get_high() < lastC.zd
+                    c3Sell := true
+                    if showSignalLabels
+                        gc.drawLabel(lastS.endIdx, lastS.endPx, "C3 Sell", col_label_sell, label.style_label_down, col_text)
+
+// ==============================
+// 7. 交易执行 (Execution)
+// ==============================
+// Global Execution Variables
+var float g_long_entry = na
+var float g_long_sl    = na
+var int   g_long_stage = 0 
+var float g_short_entry = na
+var float g_short_sl    = na
+var int   g_short_stage = 0
+
+// Helper Functions for Execution
+do_buy(_id, _sl, _riskPct) =>
+    bool executed = false
+    if strategy.position_size <= 0
+        float riskPerShare = close - _sl
+        if riskPerShare > 0
+            float riskAmount = strategy.equity * (_riskPct / 100.0)
+            float qty_l = riskAmount / riskPerShare
+            strategy.entry("Long", strategy.long, qty=qty_l, comment=_id)
+            strategy.exit("L_TP1", from_entry="Long", qty_percent=33.3, limit=close + riskPerShare, stop=_sl, comment_profit="TP1", comment_loss="SL")
+            strategy.exit("L_TP2", from_entry="Long", qty_percent=33.3, limit=close + 2*riskPerShare, stop=_sl, comment_profit="TP2", comment_loss="SL")
+            strategy.exit("L_Run", from_entry="Long", qty_percent=100, stop=_sl, comment_profit="Run", comment_loss="SL")
+            executed := true
+    executed
+
+do_sell(_id, _sl, _riskPct) =>
+    bool executed = false
+    if strategy.position_size >= 0
+        float riskPerShare = _sl - close
+        if riskPerShare > 0
+            float riskAmount = strategy.equity * (_riskPct / 100.0)
+            float qty_s = riskAmount / riskPerShare
+            strategy.entry("Short", strategy.short, qty=qty_s, comment=_id)
+            strategy.exit("S_TP1", from_entry="Short", qty_percent=33.3, limit=close - riskPerShare, stop=_sl, comment_profit="TP1", comment_loss="SL")
+            strategy.exit("S_TP2", from_entry="Short", qty_percent=33.3, limit=close - 2*riskPerShare, stop=_sl, comment_profit="TP2", comment_loss="SL")
+            strategy.exit("S_Run", from_entry="Short", qty_percent=100, stop=_sl, comment_profit="Run", comment_loss="SL")
+            executed := true
+    executed
+
+// Execution Logic
+// We need to detect if a signal *just* happened. 
+// Our signal variables (c1Buy, etc.) are stateful flags.
+// We should reset them after execution or check if they were set *this bar*.
+// In the signal logic above, we set `c1Buy := true` when conditions are met.
+// We need to ensure we don't re-execute on the same bar if already executed?
+// Pine Script strategy executes on close.
+// We can use `stroke_updated` flag if we had it.
+// Let's check if `madePH` or `madePL` was true.
+bool stroke_updated = madePH or madePL
+
+if useC1ForEntry and stroke_updated
+    if c1Buy
+        if strategy.position_size < 0 
+            strategy.close("Short", comment="Short Run Exit")
+        if do_buy("Long_C1", c1BuyPx, risk_per_trade)
+            g_long_entry := close
+            g_long_sl := c1BuyPx
+            g_long_stage := 0
+        c1Buy := false // Reset flag
+
+    if c1Sell
+        if strategy.position_size > 0 
+            strategy.close("Long", comment="Long Run Exit")
+        if do_sell("Short_C1", c1SellPx, risk_per_trade)
+            g_short_entry := close, g_short_sl := c1SellPx, g_short_stage := 0
+        c1Sell := false
+
+if stroke_updated
+    if c2BuyTrig
+        if strategy.position_size < 0 
+            strategy.close("Short", comment="Short Run Exit")
+        if do_buy("Long_C2", c1BuyPx, risk_per_trade)
+            g_long_entry := close, g_long_sl := c1BuyPx, g_long_stage := 0
+        c2BuyTrig := false
+
+    if c2SellTrig
+        if strategy.position_size > 0 
+            strategy.close("Long", comment="Long Run Exit")
+        if do_sell("Short_C2", c1SellPx, risk_per_trade)
+            g_short_entry := close, g_short_sl := c1SellPx, g_short_stage := 0
+        c2SellTrig := false
+
+    if c3Buy
+        // Use lastZG as SL? Or c1BuyPx?
+        // Whitepaper says C3 is pullback to ZG. SL should be below ZG or at ZG.
+        // Let's use lastZG if available, else c1BuyPx (fallback)
+        float sl_val = not na(centerSt.zg) ? centerSt.zg : c1BuyPx // Note: centerSt might be current center.
+        // If C3, we are outside center. centerSt might be invalid or new.
+        // We need the *confirmed* center's ZG.
+        // We stored it in `centers` array.
+        float lastZG = na
+        if centers.size() > 0
+            lastZG := centers.get(centers.size()-1).zg
+        
+        float final_sl = not na(lastZG) ? lastZG : c1BuyPx
+        
+        if do_buy("Long_C3", final_sl, risk_per_trade)
+            g_long_entry := close
+            g_long_sl := final_sl
+            g_long_stage := 0
+        c3Buy := false
+
+    if c3Sell
+        float lastZD = na
+        if centers.size() > 0
+            lastZD := centers.get(centers.size()-1).zd
+        
+        float final_sl_s = not na(lastZD) ? lastZD : c1SellPx
+        
+        if do_sell("Short_C3", final_sl_s, risk_per_trade)
+            g_short_entry := close, g_short_sl := final_sl_s
+            g_short_stage := 0
+        c3Sell := false
+
+// Dynamic Stop Loss & Profit Taking (3-Stage)
+if strategy.position_size > 0 and not na(g_long_entry) and not na(g_long_sl)
+    risk = g_long_entry - g_long_sl
+    if high >= (g_long_entry + risk) and g_long_stage < 1
+        g_long_stage := 1
+        strategy.exit("L_TP2", from_entry="Long", qty_percent=33.3, limit=g_long_entry + 2*risk, stop=g_long_entry, comment_profit="TP2", comment_loss="SL_BE")
+        strategy.exit("L_Run", from_entry="Long", qty_percent=100, stop=g_long_entry, comment_profit="Run", comment_loss="SL_BE")
+    if high >= (g_long_entry + 2*risk) and g_long_stage < 2
+        g_long_stage := 2
+        strategy.exit("L_Run", from_entry="Long", qty_percent=100, stop=g_long_entry + risk, comment_profit="Run", comment_loss="SL_1R")
+
+if strategy.position_size < 0 and not na(g_short_entry) and not na(g_short_sl)
+    risk = g_short_sl - g_short_entry
+    if low <= (g_short_entry - risk) and g_short_stage < 1
+        g_short_stage := 1
+        strategy.exit("S_TP2", from_entry="Short", qty_percent=33.3, limit=g_short_entry - 2*risk, stop=g_short_entry, comment_profit="TP2", comment_loss="SL_BE")
+        strategy.exit("S_Run", from_entry="Short", qty_percent=100, stop=g_short_entry, comment_profit="Run", comment_loss="SL_BE")
+    if low <= (g_short_entry - 2*risk) and g_short_stage < 2
+        g_short_stage := 2
+        strategy.exit("S_Run", from_entry="Short", qty_percent=100, stop=g_short_entry - risk, comment_profit="Run", comment_loss="SL_1R")
+
+// Manual Aux Lines
+man_Enable = input.bool(false, "启用手动辅助线", group=grpMoney)
+man_EntryPrice_str = input.string("", "手动入场价", group=grpMoney)
+man_EntryPrice_val = str.length(man_EntryPrice_str) == 0 ? na : str.tonumber(man_EntryPrice_str)
+
+if man_Enable and not na(man_EntryPrice_val)
+    line.new(bar_index, man_EntryPrice_val, bar_index+10, man_EntryPrice_val, color=color.white, width=2)

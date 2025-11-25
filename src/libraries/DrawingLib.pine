@@ -1,0 +1,44 @@
+//@version=6
+library("DrawingLib", overlay=true)
+
+// ==============================
+// Garbage Collection & Drawing
+// ==============================
+
+// Global arrays for GC (Note: In libraries, we can't use 'var' for global state easily across multiple script executions, 
+// but for a library used by a single indicator, we can manage state within objects or pass arrays).
+// However, Pine Script libraries are stateless between executions unless we use UDTs to hold state.
+// A better approach for v6 library is to encapsulate the GC manager in a UDT.
+
+export type GCManager
+    array<line> lines
+    array<box> boxes
+    array<label> labels
+    int limit
+
+export method init(GCManager this, int limit=400)
+    this.lines := array.new_line()
+    this.boxes := array.new_box()
+    this.labels := array.new_label()
+    this.limit := limit
+
+export method drawLine(GCManager this, int x1, float y1, int x2, float y2, string xloc=xloc.bar_index, color color=color.blue, int width=1, string style=line.style_solid)
+    l = line.new(x1, y1, x2, y2, xloc=xloc, color=color, width=width, style=style)
+    this.lines.push(l)
+    if this.lines.size() > this.limit
+        line.delete(this.lines.shift())
+    l
+
+export method drawBox(GCManager this, int l, float t, int r, float b, string xloc=xloc.bar_index, color border=color.blue, color bg=color.new(color.blue, 90), string txt="", color txt_color=color.white)
+    bx = box.new(l, t, r, b, xloc=xloc, border_color=border, bgcolor=bg, text=txt, text_color=txt_color, text_size=size.small, text_halign=text.align_right)
+    this.boxes.push(bx)
+    if this.boxes.size() > this.limit
+        box.delete(this.boxes.shift())
+    bx
+
+export method drawLabel(GCManager this, int x, float y, string txt, color color=color.blue, string style=label.style_label_up, color textcolor=color.white)
+    lb = label.new(x, y, txt, xloc=xloc.bar_index, color=color, style=style, textcolor=textcolor, size=size.small)
+    this.labels.push(lb)
+    if this.labels.size() > this.limit
+        label.delete(this.labels.shift())
+    lb
