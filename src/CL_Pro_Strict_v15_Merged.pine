@@ -16,16 +16,16 @@ method init(GCManager this, int limit=400) =>
     this.labels := array.new<label>()
     this.limit := limit
 
-method drawLine(GCManager this, int x1, float y1, int x2, float y2, string xloc=xloc.bar_index, color color=color.blue, int width=1, string style=line.style_solid) =>
-    l = line.new(x1, y1, x2, y2, xloc=xloc, color=color, width=width, style=style)
+method drawLine(GCManager this, int x1, float y1, int x2, float y2, string xloc_=xloc.bar_index, color color_=color.blue, int width=1, string style=line.style_solid) =>
+    l = line.new(x1, y1, x2, y2, xloc=xloc_, color=color_, width=width, style=style)
     this.lines.push(l)
     if this.lines.size() > this.limit
         line.delete(this.lines.shift())
     l
 
-method drawBox(GCManager this, int l, float t, int r, float b, string xloc=xloc.bar_index, color border=color.blue, color bg=na, string txt="", color txt_color=color.white) =>
+method drawBox(GCManager this, int l, float t, int r, float b, string xloc_=xloc.bar_index, color border=color.blue, color bg=na, string txt="", color txt_color=color.white) =>
     _bg = na(bg) ? color.new(color.blue, 90) : bg
-    bx = box.new(l, t, r, b, xloc=xloc, border_color=border, bgcolor=_bg, text=txt, text_color=txt_color, text_size=size.small, text_halign=text.align_right)
+    bx = box.new(l, t, r, b, xloc=xloc_, border_color=border, bgcolor=_bg, text=txt, text_color=txt_color, text_size=size.small, text_halign=text.align_right)
     this.boxes.push(bx)
     if this.boxes.size() > this.limit
         box.delete(this.boxes.shift())
@@ -49,6 +49,19 @@ type Stroke
     int dir // 1: Up, -1: Down
     float macdHist // MACD at end
     line l // Visualization line object
+    bool confirmed
+
+type Segment
+    int startIdx
+    float startPx
+    int endIdx
+    float endPx
+    int dir
+    float high
+    float low
+    int startStrokeIdx
+    int endStrokeIdx
+    line l
 
 type CenterState
     bool inCenter
@@ -59,9 +72,11 @@ type CenterState
     int enterDir
     int exitDir
     int ori // 1: Up, -1: Down, 0: Invalid
+    int segCount
+    int level
 
 method copy(CenterState this) =>
-    CenterState.new(this.inCenter, this.zg, this.zd, this.startStr, this.lastStr, this.enterDir, this.exitDir, this.ori)
+    CenterState.new(this.inCenter, this.zg, this.zd, this.startStr, this.lastStr, this.enterDir, this.exitDir, this.ori, this.segCount, this.level)
 
 type SegState
     bool inProgress
@@ -77,7 +92,7 @@ type SegState
     int strokeCnt
 
 // Helper to get value at specific bar index
-get_val_at_bar(float src, int idx) =>
+get_val_at_bar(series float src, int idx) =>
     ta.valuewhen(bar_index == idx, src, 0)
 
 // Stroke Logic
@@ -99,8 +114,8 @@ method update(array<Stroke> strokes, bool hasPivot, bool isHigh, int idx, float 
     newStroke
 
 // Simplified Stroke Creator (Caller tracks last pivot)
-createStroke(int lpIdx, float lpPx, int idx, float price, int dir, float hist) =>
-    Stroke.new(lpIdx, lpPx, idx, price, dir, hist, line(na))
+createStroke(int lpIdx, float lpPx, int idx, float price, int dir, float hist, bool confirmed=false) =>
+    Stroke.new(lpIdx, lpPx, idx, price, dir, hist, na, confirmed)
 
 method get_high(Stroke this) =>
     math.max(this.startPx, this.endPx)
@@ -109,7 +124,7 @@ method get_low(Stroke this) =>
     math.min(this.startPx, this.endPx)
 
 // Center Logic
-method update(CenterState st, array<Stroke> strokes, int lastCenterEndIdx) =>
+method update(CenterState st, array<Stroke> strokes, int lastCenterEndIdx, float atrv, bool useLock, float minH, float maxOverlap, float mergeRatio, array<CenterState> centers, array<Segment> superSegs) =>
     int status = 0 // 0: Nothing, 1: New, 2: Extension, 3: Finished
     sz = strokes.size()
     if sz >= 3
@@ -138,15 +153,66 @@ method update(CenterState st, array<Stroke> strokes, int lastCenterEndIdx) =>
                 bool isDownCenter = (enterD == -1) and (d2 == 1) and (d1 == -1) and (d0 == 1)
                 bool isUpCenter   = (enterD == 1)  and (d2 == -1) and (d1 == 1)  and (d0 == -1)
                 
-                if (isDownCenter or isUpCenter) and (hi >= lo)
-                    st.zg := hi
-                    st.zd := lo
-                    st.inCenter := true
-                    st.startStr := sz - 3
-                    st.lastStr := sz - 1
-                    st.enterDir := enterD
-                    st.ori := 0
-                    status := 1
+                // 4. New Filters
+                // Height Filter
+                float boxHeight = hi - lo
+                bool passHeight = boxHeight >= minH * atrv
+
+                // Overlap Filter
+                bool passOverlap = true
+                if centers.size() > 0
+                    lastC = centers.get(centers.size()-1)
+                    float pZG = lastC.zg
+                    float pZD = lastC.zd
+                    float overlap = math.max(0.0, math.min(hi, pZG) - math.max(lo, pZD))
+                    float uni     = math.max(hi, pZG) - math.min(lo, pZD)
+                    float ratio   = uni > 0 ? overlap/uni : 0
+                    passOverlap := ratio <= maxOverlap
+                
+                // Lock Filter (Simplified: if useLock, require last center to be broken with trend i.e. ori!=0)
+                // Exception: First center (centers.size() == 0)
+                bool isLocked = useLock and centers.size() > 0 and st.ori == 0
+
+                if (isDownCenter or isUpCenter) and (hi >= lo) and passHeight and passOverlap and not isLocked
+                    // Try to merge with previous center
+                    bool merged = false
+                    if centers.size() > 0
+                        lastC = centers.get(centers.size() - 1)
+                        float prevZG = lastC.zg
+                        float prevZD = lastC.zd
+                        float interTop = math.min(prevZG, hi)
+                        float interBot = math.max(prevZD, lo)
+                        float interW = interTop - interBot
+                        float prevW = prevZG - prevZD
+                        float candW = hi - lo
+                        
+                        if interW > 0 and (interW / math.min(prevW, candW)) >= mergeRatio
+                            // Merge
+                            mergedZG = math.min(prevZG, hi)
+                            mergedZD = math.max(prevZD, lo)
+                            st.zg := mergedZG
+                            st.zd := mergedZD
+                            st.inCenter := true
+                            st.startStr := sz - 3
+                            st.lastStr := sz - 1
+                            st.enterDir := enterD
+                            st.ori := 0
+                            
+                            // Update previous stored center
+                            lastC.zg := mergedZG
+                            lastC.zd := mergedZD
+                            
+                            merged := true
+                        
+                    if not merged
+                        st.zg := hi
+                        st.zd := lo
+                        st.inCenter := true
+                        st.startStr := sz - 3
+                        st.lastStr := sz - 1
+                        st.enterDir := enterD
+                        st.ori := 0
+                        status := 1
         else
             // Extension
             s = strokes.get(sz - 1)
@@ -171,8 +237,134 @@ method update(CenterState st, array<Stroke> strokes, int lastCenterEndIdx) =>
                 status := 3
     status
 
+// Center Logic (Segment Based)
+method update(CenterState st, array<Segment> segs, int lastCenterEndIdx, float atrv, bool useLock, float minH, float maxOverlap, float mergeRatio, array<CenterState> centers, array<Segment> superSegs, bool relax_center_rule) =>
+    int status = 0 // 0: Nothing, 1: New, 2: Extension, 3: Finished, 4: Upgrade
+    sz = segs.size()
+    if sz >= 3
+        if not st.inCenter
+            // Ensure new center starts AFTER the last finished center
+            if (sz - 3) > lastCenterEndIdx
+                s0 = segs.get(sz - 1)
+                s1 = segs.get(sz - 2)
+                s2 = segs.get(sz - 3)
+                
+                // 1. Price Overlap
+                hi = math.min(s2.high, math.min(s1.high, s0.high))
+                lo = math.max(s2.low, math.max(s1.low, s0.low))
+                
+                // 2. Direction
+                d0 = s0.dir
+                d1 = s1.dir
+                d2 = s2.dir
+                
+                // Enter Direction (from previous segment)
+                enterD = 0
+                if sz >= 4
+                    enterD := segs.get(sz - 4).dir
+                
+                // 3. Strict Pattern
+                bool isDownCenter = relax_center_rule ? (d2==1 and d1==-1 and d0==1) : ((enterD == -1) and (d2==1) and (d1==-1) and (d0==1))
+                bool isUpCenter   = relax_center_rule ? (d2==-1 and d1==1 and d0==-1) : ((enterD == 1)  and (d2==-1) and (d1==1)  and (d0==-1))
+                
+                // 4. New Filters
+                // Height Filter
+                float boxHeight = hi - lo
+                bool passHeight = boxHeight >= minH * atrv // Apply ATR filter if needed, or 0
+
+                // Overlap Filter
+                bool passOverlap = true
+                if centers.size() > 0
+                    lastC = centers.get(centers.size()-1)
+                    float pZG = lastC.zg
+                    float pZD = lastC.zd
+                    float overlap = math.max(0.0, math.min(hi, pZG) - math.max(lo, pZD))
+                    float uni     = math.max(hi, pZG) - math.min(lo, pZD)
+                    float ratio   = uni > 0 ? overlap/uni : 0
+                    passOverlap := ratio <= maxOverlap
+                
+                // Lock Filter
+                bool isLocked = useLock and centers.size() > 0 and st.ori == 0
+
+                if (isDownCenter or isUpCenter) and (hi >= lo) and passHeight and passOverlap and not isLocked
+                    // Try to merge with previous center
+                    bool merged = false
+                    if centers.size() > 0
+                        lastC = centers.get(centers.size() - 1)
+                        float prevZG = lastC.zg
+                        float prevZD = lastC.zd
+                        float interTop = math.min(prevZG, hi)
+                        float interBot = math.max(prevZD, lo)
+                        float interW = interTop - interBot
+                        float prevW = prevZG - prevZD
+                        float candW = hi - lo
+                        
+                        if interW > 0 and (interW / math.min(prevW, candW)) >= mergeRatio
+                            // Merge
+                            mergedZG = math.min(prevZG, hi)
+                            mergedZD = math.max(prevZD, lo)
+                            st.zg := mergedZG
+                            st.zd := mergedZD
+                            st.inCenter := true
+                            st.startStr := sz - 3
+                            st.lastStr := sz - 1
+                            st.enterDir := enterD
+                            st.ori := 0
+                            st.segCount := lastC.segCount + 3 // Inherit and add
+                            st.level := lastC.level
+                            
+                            // Update previous stored center
+                            lastC.zg := mergedZG
+                            lastC.zd := mergedZD
+                            lastC.segCount := st.segCount
+                            
+                            merged := true
+                        
+                    if not merged
+                        st.zg := hi
+                        st.zd := lo
+                        st.inCenter := true
+                        st.startStr := sz - 3
+                        st.lastStr := sz - 1
+                        st.enterDir := enterD
+                        st.ori := 0
+                        st.segCount := 3
+                        st.level := 0
+                        status := 1
+        else
+            // Extension
+            s = segs.get(sz - 1)
+            // Check overlap with current ZG/ZD
+            float sHi = s.high
+            float sLo = s.low
+            
+            // Overlap condition: sLo <= ZG and sHi >= ZD
+            bool overlaps = sLo <= st.zg and sHi >= st.zd
+            
+            if overlaps
+                st.zg := math.min(st.zg, sHi)
+                st.zd := math.max(st.zd, sLo)
+                st.lastStr := sz - 1
+                st.segCount += 1
+                status := 2
+                
+                // Check for Upgrade (9 segments)
+                if st.segCount % 9 == 0
+                    st.level += 1
+                    status := 4
+            else
+                // Break
+                st.exitDir := s.dir
+                if st.exitDir == st.enterDir
+                    st.ori := st.exitDir
+                else
+                    st.ori := 0
+                st.inCenter := false
+                status := 3
+    status
+
 // Segment Logic
-method update(SegState st, array<Stroke> strokes, int minStrokes) =>
+method update(SegState st, array<Stroke> strokes, int minStrokes, array<Segment> segments) =>
     didFinalize = false
     sz = strokes.size()
     if sz > 0
@@ -185,9 +377,6 @@ method update(SegState st, array<Stroke> strokes, int minStrokes) =>
             s0 = strokes.get(i0), s2 = strokes.get(i2)
             
             // Determine direction based on High/Low of strokes
-            // If Up Segment, we expect Higher Highs? 
-            // Standard ChanLun: Segment starts from a feature sequence.
-            // Simplified here: Direction based on end prices of strokes
             dirCand = s0.endPx > s2.endPx ? 1 : -1
             
             st.dir := dirCand
@@ -242,6 +431,44 @@ method update(SegState st, array<Stroke> strokes, int minStrokes) =>
                     if st.strokeCnt >= minStrokes
                         // Finalize Segment
                         didFinalize := true
+                        
+                        // Start/End Strokes
+                        sStart = strokes.get(st.startStr)
+                        sPeak = strokes.get(st.peakStr)
+                        
+                        int sIdx = na
+                        float sPx = na
+                        int eIdx = na
+                        float ePx = na
+                        
+                        if st.dir == 1 // Up Segment
+                            sIdx := sStart.dir == 1 ? sStart.startIdx : sStart.endIdx
+                            sPx := math.min(sStart.startPx, sStart.endPx)
+                            eIdx := sPeak.dir == 1 ? sPeak.endIdx : sPeak.startIdx
+                            ePx := math.max(sPeak.startPx, sPeak.endPx)
+                        else // Down Segment
+                            sIdx := sStart.dir == 1 ? sStart.endIdx : sStart.startIdx
+                            sPx := math.max(sStart.startPx, sStart.endPx)
+                            eIdx := sPeak.dir == 1 ? sPeak.startIdx : sPeak.endIdx
+                            ePx := math.min(sPeak.startPx, sPeak.endPx)
+                            
+                        // Calculate True Segment High/Low (Iterate all strokes in range)
+                        int iStart = math.min(st.startStr, st.peakStr)
+                        int iEnd = math.max(st.startStr, st.peakStr)
+                        float segHigh = -1e10
+                        float segLow = 1e10
+                        
+                        for i = iStart to iEnd
+                            strk = strokes.get(i)
+                            float hi = math.max(strk.startPx, strk.endPx)
+                            float lo = math.min(strk.startPx, strk.endPx)
+                            segHigh := math.max(segHigh, hi)
+                            segLow := math.min(segLow, lo)
+                            
+                        // Create Segment with True High/Low
+                        Segment seg = Segment.new(sIdx, sPx, eIdx, ePx, st.dir, segHigh, segLow, iStart, iEnd, line(na))
+                        segments.push(seg)
+
                         // New Segment starts from Peak
                         st.oldStartStr := st.startStr // Save previous start
                         st.startStr := st.peakStr
@@ -272,6 +499,12 @@ lrb = input.int(1, "分型左右K数", minval=1, group=grpA)
 minBarsStroke = input.int(4, "成笔最小跨度", minval=1, group=grpA)
 useNorm = input.bool(true, "启用K线包含处理", group=grpA)
 minStrokesPerSeg = input.int(3, "线段最少包含笔数", minval=3, group=grpA)
+center_lock_until_break = input.bool(true,  "中枢锁：未破不新开", group=grpA)
+center_min_height_atr   = input.float(0.0, "中枢最小高度(ATR倍)", step=0.05, group=grpA)
+center_overlap_max_ratio= input.float(0.8, "与上个中枢重叠上限", step=0.05, group=grpA)
+center_merge_ratio = input.float(0.5, "中枢合并重叠阈值(占较窄者比例)", step=0.05, minval=0.0, maxval=1.0, group=grpA)
+use_segment_center = input.bool(true, "使用线段构建中枢 (Segment Centers)", group=grpA)
+relax_center_rule = input.bool(true, "放宽中枢进入判定", group=grpA)
 
 grpDisp = "2. 显示开关 (Display)"
 showInclusion   = input.bool(false, "显示包含处理K线", group=grpDisp)
@@ -333,13 +566,18 @@ if barstate.isfirst
     gc.init(400)
 
 var strokes = array.new<Stroke>()
-var centerSt = CenterState.new(false, na, na, na, na, 0, 0, 0)
+var segments = array.new<Segment>()
+var superSegments = array.new<Segment>()
+var centerSt = CenterState.new(false, na, na, na, na, 0, 0, 0, 0, 0)
 var segSt = SegState.new(false, na, na, 0, na, na, na, na, na, 0)
 
 // ==============================
 // 3. 预处理 (Preprocessing)
 // ==============================
 [macd, signal, hist] = ta.macd(close, 12, 26, 9)
+atrv = ta.atr(20)
+var box activeCenterBox = na
+var line liveSeg = line.new(na, na, na, na, width=segLineWidth)
 
 // Gaussian
 basis = ta.ema(close, gauss_len)
@@ -399,8 +637,10 @@ leftBars = input.int(1, "左侧K线数 (Left Bars)", minval=1, group="Standard L
 rightBars = input.int(1, "右侧K线数 (Right Bars)", minval=1, group="Standard Logic")
 
 // Standard Pivot Detection
-ph = ta.pivothigh(high, leftBars, rightBars)
-pl = ta.pivotlow(low, leftBars, rightBars)
+srcHigh = useNorm ? nHigh : high
+srcLow = useNorm ? nLow : low
+ph = ta.pivothigh(srcHigh, leftBars, rightBars)
+pl = ta.pivotlow(srcLow, leftBars, rightBars)
 
 // Stroke Generation
 var int lastPivotIdx = na
@@ -408,128 +648,83 @@ var float lastPivotPx = na
 var int lastPivotDir = 0 // 1: High, -1: Low
 
 bool newStrokeAdded = false
+var line liveStroke = line.new(na, na, na, na)
 
 // Process New Pivot
-if not na(ph)
-    // Found a High Pivot
-    int idx = bar_index[rightBars]
-    float px = ph
+if not na(ph) or not na(pl)
+    int idx = bar_index - rightBars
+    float px = na(ph) ? pl : ph
+    int dir = na(ph) ? -1 : 1
     
-    if lastPivotDir == -1 // Last was Low, now High -> Up Stroke
-        // Check validity (simple check)
-        if idx > lastPivotIdx
-            // Create Up Stroke
-            s = Stroke.new(lastPivotIdx, lastPivotPx, idx, px, 1, 0, line(na))
+    // Unified State Machine for Stroke Generation
+    // Check if we can Extend
+    bool canExtend = false
+    if lastPivotDir == dir
+        if (dir == 1 and px > lastPivotPx) or (dir == -1 and px < lastPivotPx)
+            canExtend := true
+    
+    if canExtend
+        // Extension
+        if strokes.size() > 0
+            lastS = strokes.get(strokes.size() - 1)
+            lastS.endIdx := idx
+            lastS.endPx := px
+            lastS.macdHist := get_val_at_bar(hist, idx) // Update MACD
+            
+            // Update State
+            lastPivotIdx := idx
+            lastPivotPx := px
+            
+            if showStrokeLines
+                line.set_xy2(lastS.l, idx, px)
+                line.set_style(lastS.l, line.style_dotted) // Ensure dotted during extension
+                
+    else
+        // Check if we can Create New (Flip)
+        bool flipOk = (lastPivotDir != dir) and (lastPivotDir != 0)
+        if flipOk and (idx - lastPivotIdx >= minBarsStroke)
+            // Confirm Previous Stroke
+            if strokes.size() > 0
+                prev = strokes.get(strokes.size() - 1)
+                if not prev.confirmed and not na(prev.l)
+                    prev.confirmed := true
+                    line.set_style(prev.l, line.style_solid)
+                    // Color is already correct, no need to change
+            
+            // Create New Stroke (Unconfirmed, Dotted)
+            Stroke s = Stroke.new(lastPivotIdx, lastPivotPx, idx, px, dir, get_val_at_bar(hist, idx), na, false)
             strokes.push(s)
-            strictStrokes.push(s)
+            // strictStrokes.push(s) // Avoid reference sharing if not needed
             newStrokeAdded := true
             
             // Update State
             lastPivotIdx := idx
             lastPivotPx := px
-            lastPivotDir := 1
+            lastPivotDir := dir
             
             // Draw
             if showStrokeLines
-                s.l := gc.drawLine(s.startIdx, s.startPx, s.endIdx, s.endPx, xloc.bar_index, col_stroke_up, 2)
-
-    else if lastPivotDir == 1 // Last was High, found new High
-        // Update High if higher
-        if px > lastPivotPx
-            // Extend the current Up Stroke
-            if strokes.size() > 0
-                lastS = strokes.get(strokes.size() - 1)
-                // Update End Point
-                lastS.endIdx := idx
-                lastS.endPx := px
-                
-                // Update State
-                lastPivotIdx := idx
-                lastPivotPx := px
-                
-                // Redraw (We can't easily delete the old line without ID, 
-                // but we can draw a new one over it or rely on DrawingLib to handle updates if we had IDs.
-                // Since we don't track IDs in Stroke struct here, we will just draw a new line.
-                // To avoid clutter, we should ideally delete the old one.
-                // Let's assume gc.drawLine returns void. 
-                // A better way: The DrawingLib might not support update.
-                // We will just draw the new segment. The old one will remain but be "covered" or "behind"?
-                // No, that causes "broken" look if the new one starts from the same point.
-                // Wait, if we update the END of the stroke, the START is the same.
-                // So we draw a line from Start -> New End.
-                // The old line Start -> Old End is still there.
-                // This creates a "fan" effect.
-                // To fix this properly, we need to track line IDs.
-                // BUT, for now, let's just update the state so the NEXT stroke starts from the correct point.
-                // The visual artifact of the "fan" is better than a "gap".
-                // Actually, if we don't delete, it looks messy.
-                // Let's try to just update the state for now to fix the "Gap" for the NEXT stroke.
-                // AND, we must update the `strokes` array so Center logic works.
-                
-                // Update the last stroke in the array (already done via reference? No, structs are value types in Pine?)
-                // Pine v6 structs are reference types? No, they are objects.
-                // "User-defined types are reference types". Yes!
-                // So modifying `lastS` updates the object in the array.
-                
-                // Visual Fix: We can't delete the old line without its ID.
-                // We will accept the "Fan" for a moment, or we can clear all lines and redraw? Too expensive.
-                // Let's just draw the new line.
-                if showStrokeLines
-                    line.delete(lastS.l)
-                    lastS.l := gc.drawLine(lastS.startIdx, lastS.startPx, lastS.endIdx, lastS.endPx, xloc.bar_index, col_stroke_up, 2)
+                s.l := gc.drawLine(s.startIdx, s.startPx, s.endIdx, s.endPx, xloc.bar_index, dir == 1 ? col_stroke_up : col_stroke_dn, 2, line.style_dotted)
             
-    else if lastPivotDir == 0 // Init
-        lastPivotIdx := idx
-        lastPivotPx := px
-        lastPivotDir := 1
-
-if not na(pl)
-    // Found a Low Pivot
-    int idx = bar_index[rightBars]
-    float px = pl
-    
-    if lastPivotDir == 1 // Last was High, now Low -> Down Stroke
-        // Check validity
-        if idx > lastPivotIdx
-            // Create Down Stroke
-            s = Stroke.new(lastPivotIdx, lastPivotPx, idx, px, -1, 0, line(na))
-            strokes.push(s)
-            strictStrokes.push(s)
-            newStrokeAdded := true
+            // Reset Live Stroke
+            line.set_xy1(liveStroke, idx, px)
+            line.set_xy2(liveStroke, bar_index, close)
             
-            // Update State
+        else if lastPivotDir == 0 // Init
             lastPivotIdx := idx
             lastPivotPx := px
-            lastPivotDir := -1
-            
-            // Draw
-            if showStrokeLines
-                s.l := gc.drawLine(s.startIdx, s.startPx, s.endIdx, s.endPx, xloc.bar_index, col_stroke_dn, 2)
+            lastPivotDir := dir
 
-    else if lastPivotDir == -1 // Last was Low, found new Low
-        if px < lastPivotPx
-            // Extend the current Down Stroke
-            if strokes.size() > 0
-                lastS = strokes.get(strokes.size() - 1)
-                lastS.endIdx := idx
-                lastS.endPx := px
-                
-                lastPivotIdx := idx
-                lastPivotPx := px
-                
-                if showStrokeLines
-                    line.delete(lastS.l)
-                    lastS.l := gc.drawLine(lastS.startIdx, lastS.startPx, lastS.endIdx, lastS.endPx, xloc.bar_index, col_stroke_dn, 2)
-    
-    else if lastPivotDir == 0 // Init
-        lastPivotIdx := idx
-        lastPivotPx := px
-        lastPivotDir := -1
-
-// Debug Plots (Unconditional) - Disabled
-// plot(mergedBars.size(), "Merged Bars Size", color.yellow)
-// plot(typings.size(), "Typings Size", color.blue)
-// plot(strokes.size(), "Strokes Size", color.white)
+// Live Stroke Update
+// Live Stroke Update
+if not na(lastPivotIdx) and lastPivotDir != 0
+    float y2 = lastPivotDir == -1 ? high : low
+    line.set_xy1(liveStroke, lastPivotIdx, lastPivotPx)
+    line.set_xy2(liveStroke, bar_index, y2)
+    line.set_style(liveStroke, line.style_dotted)
+    line.set_color(liveStroke, lastPivotDir == -1 ? col_stroke_up : col_stroke_dn)
+else
+    line.set_xy1(liveStroke, na, na), line.set_xy2(liveStroke, na, na)
 
 
 
@@ -539,88 +734,115 @@ if not na(pl)
 
 var centers = array.new<CenterState>()
 var int lastCenterEndIdx = -1 // Track the last stroke index of the previous center
-
 if newStrokeAdded
-    // Update Centers
-    int cStatus = centerSt.update(strokes, lastCenterEndIdx)
+    // Update Segments first (if using segment centers, we need segments)
+    bool segFinished = segSt.update(strokes, minStrokesPerSeg, segments)
     
-    // Draw Center Box
-    if centerSt.inCenter
-        // Logic to draw/update box
-        if showCenter
-            sStart = strokes.get(centerSt.startStr)
-            sEnd = strokes.get(centerSt.lastStr)
+    if segFinished and showSegLines and segments.size() > 0
+        seg = segments.get(segments.size() - 1)
+        col = seg.dir == 1 ? col_seg_up : col_seg_dn
+        
+        int x1 = seg.startIdx
+        float y1 = seg.startPx
+        int x2 = seg.endIdx
+        float y2 = seg.endPx
+        
+        seg.l := gc.drawLine(x1, y1, x2, y2, xloc.bar_index, col, segLineWidth)
+
+// Update Centers (Every Bar)
+int cStatus = 0
+if use_segment_center
+    cStatus := centerSt.update(segments, lastCenterEndIdx, atrv, center_lock_until_break, center_min_height_atr, center_overlap_max_ratio, center_merge_ratio, centers, superSegments, relax_center_rule)
+else
+    cStatus := centerSt.update(strokes, lastCenterEndIdx, atrv, center_lock_until_break, center_min_height_atr, center_overlap_max_ratio, center_merge_ratio, centers, superSegments)
+
+// Draw Center Box
+if centerSt.inCenter
+    // Logic to draw/update box
+    if showCenter
+        // Determine Start/End indices based on Stroke or Segment
+        int sIdx = na
+        int eIdx = na
+        if use_segment_center
+            if segments.size() > centerSt.startStr and segments.size() > centerSt.lastStr
+                sIdx := segments.get(centerSt.startStr).startIdx
+                eIdx := segments.get(centerSt.lastStr).endIdx
+        else
+            if strokes.size() > centerSt.startStr and strokes.size() > centerSt.lastStr
+                sIdx := strokes.get(centerSt.startStr).startIdx
+                eIdx := strokes.get(centerSt.lastStr).endIdx
+        
+        if not na(sIdx) and not na(eIdx)
             txt = showCenterLabels ? "ZG:" + str.tostring(centerSt.zg, "#.##") + "\nZD:" + str.tostring(centerSt.zd, "#.##") : ""
-            gc.drawBox(sStart.startIdx, centerSt.zg, sEnd.endIdx, centerSt.zd, xloc.bar_index, color.new(col_center_bg, 50), col_center_bg, txt, col_text)
+            
+            // Color based on Level
+            color bgCol = col_center_bg
+            if centerSt.level == 1
+                bgCol := color.new(color.purple, 50)
+                txt += "\nL1"
+            else if centerSt.level >= 2
+                bgCol := color.new(color.red, 50)
+                txt += "\nL" + str.tostring(centerSt.level)
+            
+            color brd = color.new(color.orange, 0)
+            
+            if na(activeCenterBox)
+                // New Center Box
+                activeCenterBox := gc.drawBox(sIdx, centerSt.zg, eIdx, centerSt.zd, xloc.bar_index, brd, bgCol, txt, col_text)
+            else
+                // Update Existing Box
+                box.set_left(activeCenterBox, sIdx)
+                box.set_right(activeCenterBox, eIdx)
+                box.set_top(activeCenterBox, centerSt.zg)
+                box.set_bottom(activeCenterBox, centerSt.zd)
+                box.set_text(activeCenterBox, txt)
+                box.set_bgcolor(activeCenterBox, bgCol)
+                box.set_border_color(activeCenterBox, brd)
+
+if cStatus == 3 // Finished
+    centers.push(centerSt.copy())
+    lastCenterEndIdx := centerSt.lastStr // Update exclusion index
     
-    if cStatus == 3 // Finished
-        centers.push(centerSt.copy())
-        lastCenterEndIdx := centerSt.lastStr // Update exclusion index
+    if not na(activeCenterBox)
+        // Finalize Box (Thicken border)
+        box.set_border_width(activeCenterBox, 2 + math.max(0, centerSt.level))
+        activeCenterBox := na
 
-    // Update Segments
-    bool segFinished = segSt.update(strokes, minStrokesPerSeg)
-
-    if segFinished and showSegLines
-        sPrev = strokes.get(segSt.oldStartStr)
-        sCurr = strokes.get(segSt.startStr)
+// Live Segment Drawing (Seamless) - Every Bar
+if showSegLines and segSt.inProgress
+    sStart = strokes.get(segSt.startStr)
+    sEnd = strokes.get(segSt.lastStr)
+    
+    int lx1 = na
+    float ly1 = na
+    int lx2 = na
+    float ly2 = na
+    
+    if segSt.dir == 1 // Current is UP
+        // Start: Low of sStart
+        lx1 := sStart.dir == 1 ? sStart.startIdx : sStart.endIdx
+        ly1 := math.min(sStart.startPx, sStart.endPx)
+        // End: High of sEnd
+        lx2 := sEnd.dir == 1 ? sEnd.endIdx : sEnd.startIdx
+        ly2 := math.max(sEnd.startPx, sEnd.endPx)
         
-        int x1 = na
-        float y1 = na
-        int x2 = na
-        float y2 = na
+        line.set_color(liveSeg, col_seg_up)
+    else // Current is DOWN
+        // Start: High of sStart
+        lx1 := sStart.dir == 1 ? sStart.endIdx : sStart.startIdx
+        ly1 := math.max(sStart.startPx, sStart.endPx)
+        // End: Low of sEnd
+        lx2 := sEnd.dir == 1 ? sEnd.startIdx : sEnd.endIdx
+        ly2 := math.min(sEnd.startPx, sEnd.endPx)
         
-        if segSt.dir == -1 // Finished segment was UP (now turned Down)
-            // Start: Low of sPrev
-            x1 := sPrev.dir == 1 ? sPrev.startIdx : sPrev.endIdx
-            y1 := math.min(sPrev.startPx, sPrev.endPx)
-            // End: High of sCurr
-            x2 := sCurr.dir == 1 ? sCurr.endIdx : sCurr.startIdx
-            y2 := math.max(sCurr.startPx, sCurr.endPx)
-            gc.drawLine(x1, y1, x2, y2, xloc.bar_index, col_seg_up, segLineWidth)
-        else // Finished segment was DOWN (now turned Up)
-            // Start: High of sPrev
-            x1 := sPrev.dir == 1 ? sPrev.endIdx : sPrev.startIdx
-            y1 := math.max(sPrev.startPx, sPrev.endPx)
-            // End: Low of sCurr
-            x2 := sCurr.dir == 1 ? sCurr.startIdx : sCurr.endIdx
-            y2 := math.min(sCurr.startPx, sCurr.endPx)
-            gc.drawLine(x1, y1, x2, y2, xloc.bar_index, col_seg_dn, segLineWidth)
-
-    // Live Segment Drawing (Seamless)
-    var line liveSeg = line.new(na, na, na, na, width=segLineWidth)
-    if showSegLines and segSt.inProgress
-        sStart = strokes.get(segSt.startStr)
-        sEnd = strokes.get(segSt.lastStr)
+        line.set_color(liveSeg, col_seg_dn)
         
-        int lx1 = na
-        float ly1 = na
-        int lx2 = na
-        float ly2 = na
-        
-        if segSt.dir == 1 // Current is UP
-            // Start: Low of sStart
-            lx1 := sStart.dir == 1 ? sStart.startIdx : sStart.endIdx
-            ly1 := math.min(sStart.startPx, sStart.endPx)
-            // End: High of sEnd
-            lx2 := sEnd.dir == 1 ? sEnd.endIdx : sEnd.startIdx
-            ly2 := math.max(sEnd.startPx, sEnd.endPx)
-            
-            line.set_color(liveSeg, col_seg_up)
-        else // Current is DOWN
-            // Start: High of sStart
-            lx1 := sStart.dir == 1 ? sStart.endIdx : sStart.startIdx
-            ly1 := math.max(sStart.startPx, sStart.endPx)
-            // End: Low of sEnd
-            lx2 := sEnd.dir == 1 ? sEnd.startIdx : sEnd.endIdx
-            ly2 := math.min(sEnd.startPx, sEnd.endPx)
-            
-            line.set_color(liveSeg, col_seg_dn)
-            
-        line.set_xy1(liveSeg, lx1, ly1)
-        line.set_xy2(liveSeg, lx2, ly2)
-    else
-        line.set_xy1(liveSeg, na, na)
-        line.set_xy2(liveSeg, na, na)
+    line.set_xy1(liveSeg, lx1, ly1)
+    line.set_xy2(liveSeg, lx2, ly2)
+    line.set_style(liveSeg, line.style_dotted)
+else
+    line.set_xy1(liveSeg, na, na)
+    line.set_xy2(liveSeg, na, na)
 
 // ==============================
 // 6. 信号 (Signals)
