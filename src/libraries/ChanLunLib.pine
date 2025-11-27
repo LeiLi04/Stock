@@ -1,141 +1,236 @@
 //@version=6
 library("ChanLunLib", overlay=true)
 
-// ==============================
-// Core ChanLun Logic
-// ==============================
+"""
+Algorithm Summary:
+    Core implementation of the ChanLun (Zen/Entanglement Theory) market analysis framework.
+    Provides rigorous mathematical definitions for Strokes (Bi), Centers (ZhongShu), and Segments (XianDuan).
+    
+Symbol Legend:
+    S : Sequence of Strokes {s_0, s_1, ..., s_n}
+    C : Center (Pivot Zone) defined by [ZG, ZD]
+    ZG: Center High (ZhongShu Gao) = min(max(s_i))
+    ZD: Center Low (ZhongShu Di) = max(min(s_i))
+    D : Direction vector ∈ {1 (Up), -1 (Down)}
+    
+    Shape Flow (Conceptual):
+    Ticks -> Bars -> Fractals (FenXing) -> Strokes (Bi) -> Segments (XianDuan) -> Centers (ZhongShu) -> Trend/Divergence
+"""
 
+// ==========================================================================
+// STEP 01: 数据结构定义 (Data Structure Definition)
+// ==========================================================================
+
+// step 1.1: 笔 (Stroke / Bi)
+// --------------------------------------------------------------------------
+// Definition: The atomic unit of trend, connecting two fractals (Top & Bottom).
 export type Stroke
-    int startIdx
-    float startPx
-    int endIdx
-    float endPx
-    int dir // 1: Up, -1: Down
-    float macdHist // MACD at end
+    int startIdx     // Start Bar Index
+    float startPx    // Start Price
+    int endIdx       // End Bar Index
+    float endPx      // End Price
+    int dir          // Direction: 1 (Up), -1 (Down)
+    float macdHist   // MACD Histogram value at the end of stroke (for divergence check)
 
+// step 1.2: 中枢状态 (Center State / ZhongShu)
+// --------------------------------------------------------------------------
+// Definition: The overlapping price region of at least three consecutive strokes.
+// Math: Range = [ZD, ZG] where ZG = min(Highs), ZD = max(Lows)
 export type CenterState
-    bool inCenter
-    float zg
-    float zd
-    int startStr
-    int lastStr
-    int enterDir
-    int exitDir
-    int ori // 1: Up, -1: Down, 0: Invalid
+    bool inCenter    // Active flag
+    float zg         // Upper bound (ZhongShu Gao)
+    float zd         // Lower bound (ZhongShu Di)
+    int startStr     // Index of the first stroke in center
+    int lastStr      // Index of the last stroke in center
+    int enterDir     // Direction of the stroke entering the center
+    int exitDir      // Direction of the stroke leaving the center
+    int ori          // Orientation: 1 (Rising), -1 (Falling), 0 (Neutral)
 
+// step 1.3: 状态复制 (State Copy)
+// --------------------------------------------------------------------------
+// Why: Create immutable snapshot of center state for history tracking.
 export method copy(CenterState this) =>
     CenterState.new(this.inCenter, this.zg, this.zd, this.startStr, this.lastStr, this.enterDir, this.exitDir, this.ori)
 
+// step 1.4: 线段状态 (Segment State / XianDuan)
+// --------------------------------------------------------------------------
+// Definition: A higher-order trend structure composed of multiple strokes.
 export type SegState
-    bool inProgress
-    int startStr
-    int lastStr
-    int dir
-    float fHigh
-    float fLow
-    int peakStr
-    int lastEndBar
-    float lastEndPx
-    int strokeCnt
+    bool inProgress  // Active flag
+    int startStr     // Index of start stroke
+    int lastStr      // Index of current end stroke
+    int dir          // Direction: 1 (Up), -1 (Down)
+    float fHigh      // Feature Sequence High (for destruction check)
+    float fLow       // Feature Sequence Low
+    int peakStr      // Index of the stroke containing the peak price
+    int lastEndBar   // Bar index of segment end
+    float lastEndPx  // Price of segment end
+    int strokeCnt    // Number of strokes in current segment
 
-// Helper to get value at specific bar index
+// ==========================================================================
+// STEP 02: 辅助函数 (Helper Functions)
+// ==========================================================================
+
+// step 2.1: 历史值获取 (Historical Value Retrieval)
+// --------------------------------------------------------------------------
+// Args:
+//   src (float): Source series.
+//   idx (int): Target bar index.
+//
+// Returns:
+//   float: Value of src at bar_index == idx.
+//
+// Math: y = src[bar_index - idx] (Conceptually, but implemented via valuewhen)
 export get_val_at_bar(float src, int idx) =>
     ta.valuewhen(bar_index == idx, src, 0)
 
-// Stroke Logic
+// ==========================================================================
+// STEP 03: 核心逻辑更新 (Core Logic Update)
+// ==========================================================================
+
+// step 3.1: 笔更新 (Stroke Update - Placeholder)
+// --------------------------------------------------------------------------
+// Note: This function appears to be a placeholder or legacy interface. 
+// The actual stroke generation logic resides in the main script or `createStroke`.
 export method update(array<Stroke> strokes, bool hasPivot, bool isHigh, int idx, float price, int minBars)
     bool newStroke = false
     if hasPivot
-        // Check if we have any strokes yet
         if strokes.size() == 0
-            // Initialize first point (virtual) - waiting for second point to form a stroke
-            // Actually, we need a previous pivot to form a stroke. 
-            // This logic needs to be stateful. 
-            // Let's adapt the logic from main.pine.
+            // Initial state handling
             na
         else
             lastS = strokes.get(strokes.size() - 1)
-            // Logic adaptation required: The original code tracked lastPivotIndex/Price separately.
-            // We will assume the caller manages the raw pivots and calls this when a potential stroke forms.
             na
     newStroke
 
-// Simplified Stroke Creator (Caller tracks last pivot)
+// step 3.2: 笔构造工厂 (Stroke Factory)
+// --------------------------------------------------------------------------
+// Args:
+//   lpIdx, lpPx: Last Pivot Index/Price (Start of stroke).
+//   idx, price: Current Pivot Index/Price (End of stroke).
+//   dir: Direction (1 or -1).
+//   hist: MACD Histogram value.
+//
+// Returns:
+//   Stroke: New stroke object.
 export createStroke(int lpIdx, float lpPx, int idx, float price, int dir, float hist) =>
     Stroke.new(lpIdx, lpPx, idx, price, dir, hist)
 
+// step 3.3: 笔属性访问 (Stroke Properties)
+// --------------------------------------------------------------------------
 export method get_high(Stroke this) =>
     math.max(this.startPx, this.endPx)
 
 export method get_low(Stroke this) =>
     math.min(this.startPx, this.endPx)
 
-// Center Logic
+// step 3.4: 中枢更新 (Center Update)
+// --------------------------------------------------------------------------
+// Args:
+//   st (CenterState): Current center state (Mutable).
+//   strokes (array<Stroke>): History of strokes.
+//   lastCenterEndIdx (int): Exclusion index to prevent overlap.
+//
+// Returns:
+//   int: Status code (0: No Change, 1: New Center, 2: Extension, 3: Finished).
+//
+// Logic Flow:
+//   1. Check if enough strokes exist (|S| >= 3).
+//   2. If NOT in center:
+//      a. Check overlap of last 3 strokes (s0, s1, s2).
+//      b. Math: Intersection = [max(min(s_i)), min(max(s_i))]
+//      c. If Intersection exists (Hi >= Lo) -> New Center.
+//   3. If IN center:
+//      a. Check if new stroke extends the center (maintains overlap).
+//      b. If overlap breaks -> Center Finished.
 export method update(CenterState st, array<Stroke> strokes, int lastCenterEndIdx)
     int status = 0 // 0: Nothing, 1: New, 2: Extension, 3: Finished
     sz = strokes.size()
+    
+    // step 3.4a) 最小笔数检查 (Minimum Stroke Check)
+    // Why: A center requires at least 3 overlapping strokes.
     if sz >= 3
         if not st.inCenter
-            // Ensure new center starts AFTER the last finished center
-            // The first stroke of the new center is s2 (sz-3).
-            // So (sz-3) must be > lastCenterEndIdx.
+            // step 3.4b) 新中枢判定 (New Center Detection)
+            // Constraint: New center must start after the previous one ended.
             if (sz - 3) > lastCenterEndIdx
-            s0 = strokes.get(sz - 1)
-            s1 = strokes.get(sz - 2)
-            s2 = strokes.get(sz - 3)
-            
-            // 1. Price Overlap
-            hi = math.min(math.max(s2.startPx, s2.endPx), math.min(math.max(s1.startPx, s1.endPx), math.max(s0.startPx, s0.endPx)))
-            lo = math.max(math.min(s2.startPx, s2.endPx), math.max(math.min(s1.startPx, s1.endPx), math.min(s0.startPx, s0.endPx)))
-            
-            // 2. Direction
-            d0 = s0.dir
-            d1 = s1.dir
-            d2 = s2.dir
-            
-            // Enter Direction (from previous stroke)
-            enterD = 0
-            if sz >= 4
-                enterD := strokes.get(sz - 4).dir
-            
-            // 3. Strict Pattern
-            bool isDownCenter = (enterD == -1) and (d2 == 1) and (d1 == -1) and (d0 == 1)
-            bool isUpCenter   = (enterD == 1)  and (d2 == -1) and (d1 == 1)  and (d0 == -1)
-            
-            if (isDownCenter or isUpCenter) and (hi >= lo)
-                st.zg := hi
-                st.zd := lo
-                st.inCenter := true
-                st.startStr := sz - 3
-                st.lastStr := sz - 1
-                st.enterDir := enterD
-                st.ori := 0
-                status := 1
+                s0 = strokes.get(sz - 1) // Current
+                s1 = strokes.get(sz - 2) // Previous
+                s2 = strokes.get(sz - 3) // Pre-previous
+                
+                // Math: Calculate Overlap Region [lo, hi]
+                // hi = min(High(s0), High(s1), High(s2))
+                // lo = max(Low(s0), Low(s1), Low(s2))
+                hi = math.min(math.max(s2.startPx, s2.endPx), math.min(math.max(s1.startPx, s1.endPx), math.max(s0.startPx, s0.endPx)))
+                lo = math.max(math.min(s2.startPx, s2.endPx), math.max(math.min(s1.startPx, s1.endPx), math.min(s0.startPx, s0.endPx)))
+                
+                // Direction Logic
+                d0 = s0.dir
+                d1 = s1.dir
+                d2 = s2.dir
+                
+                // Enter Direction (from s3)
+                enterD = 0
+                if sz >= 4
+                    enterD := strokes.get(sz - 4).dir
+                
+                // Strict Pattern Check (Up-Down-Up or Down-Up-Down)
+                bool isDownCenter = (enterD == -1) and (d2 == 1) and (d1 == -1) and (d0 == 1)
+                bool isUpCenter   = (enterD == 1)  and (d2 == -1) and (d1 == 1)  and (d0 == -1)
+                
+                if (isDownCenter or isUpCenter) and (hi >= lo)
+                    st.zg := hi
+                    st.zd := lo
+                    st.inCenter := true
+                    st.startStr := sz - 3
+                    st.lastStr := sz - 1
+                    st.enterDir := enterD
+                    st.ori := 0
+                    status := 1
         else
-            // Extension
+            // step 3.4c) 中枢延伸与破坏 (Extension & Destruction)
             s = strokes.get(sz - 1)
             hi2 = math.max(s.startPx, s.endPx)
             lo2 = math.min(s.startPx, s.endPx)
+            
+            // Update potential new bounds (narrowing the center)
             newZG = math.min(st.zg, hi2)
             newZD = math.max(st.zd, lo2)
             
             if newZG >= newZD
+                // Extension: Stroke falls within or spans the center range
                 st.zg := newZG
                 st.zd := newZD
                 st.lastStr := sz - 1
                 status := 2
             else
-                // Break
+                // Break: Stroke leaves the center range
                 st.exitDir := s.dir
+                // Determine Orientation based on Exit vs Enter
                 if st.exitDir == st.enterDir
-                    st.ori := st.exitDir
+                    st.ori := st.exitDir // Trend Continuation
                 else
-                    st.ori := 0
+                    st.ori := 0 // Reversal or Indeterminate
                 st.inCenter := false
                 status := 3
     status
 
-// Segment Logic
+// step 3.5: 线段更新 (Segment Update)
+// --------------------------------------------------------------------------
+// Args:
+//   st (SegState): Current segment state.
+//   strokes (array<Stroke>): Stroke history.
+//   minStrokes (int): Minimum strokes per segment (usually 3).
+//
+// Returns:
+//   bool: True if a segment was finalized (and a new one started).
+//
+// Logic Flow:
+//   1. If New Segment: Initialize direction based on first 3 strokes.
+//   2. If In Progress:
+//      a. If stroke direction matches segment: Extend, check for new Peak.
+//      b. If stroke direction opposes segment: Check for Feature Sequence Break (DiFenXing/DingFenXing).
+//      c. If Break confirmed AND count >= minStrokes: Finalize Segment.
 export method update(SegState st, array<Stroke> strokes, int minStrokes)
     didFinalize = false
     sz = strokes.size()
@@ -144,14 +239,12 @@ export method update(SegState st, array<Stroke> strokes, int minStrokes)
         s = strokes.get(newStrIdx)
         
         if not st.inProgress and sz >= 3
-            // Initialize Segment
+            // step 3.5a) 线段初始化 (Segment Initialization)
             i0 = sz - 1, i2 = sz - 3
             s0 = strokes.get(i0), s2 = strokes.get(i2)
             
-            // Determine direction based on High/Low of strokes
-            // If Up Segment, we expect Higher Highs? 
-            // Standard ChanLun: Segment starts from a feature sequence.
-            // Simplified here: Direction based on end prices of strokes
+            // Determine Direction: Compare ends of s0 and s2
+            // Shape Flow: [s2] ... [s0] -> Trend?
             dirCand = s0.endPx > s2.endPx ? 1 : -1
             
             st.dir := dirCand
@@ -172,7 +265,7 @@ export method update(SegState st, array<Stroke> strokes, int minStrokes)
             st.inProgress := true
             
         else if st.inProgress
-            // Continue Segment
+            // step 3.5b) 线段延伸 (Segment Extension)
             if s.dir == st.dir
                 st.lastStr := newStrIdx
                 st.strokeCnt += 1
@@ -191,19 +284,21 @@ export method update(SegState st, array<Stroke> strokes, int minStrokes)
                         st.peakStr := newStrIdx
                     st.fHigh := math.max(s.startPx, s.endPx)
             else
-                // Counter Stroke
+                // step 3.5c) 线段破坏检查 (Segment Destruction Check)
                 st.strokeCnt += 1
                 broke = false
                 if st.dir > 0
+                    // Up Segment: Break if Low < Feature Sequence Low
                     if math.min(s.startPx, s.endPx) < st.fLow
                         broke := true
                 else
+                    // Down Segment: Break if High > Feature Sequence High
                     if math.max(s.startPx, s.endPx) > st.fHigh
                         broke := true
                 
                 if broke
                     if st.strokeCnt >= minStrokes
-                        // Finalize Segment
+                        // step 3.5d) 线段终结 (Segment Finalization)
                         didFinalize := true
                         // New Segment starts from Peak
                         st.startStr := st.peakStr

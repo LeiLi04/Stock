@@ -1,43 +1,116 @@
 //@version=6
 library("DrawingLib", overlay=true)
 
-// ==============================
-// Garbage Collection & Drawing
-// ==============================
+"""
+Algorithm Summary:
+    A high-performance Garbage Collection (GC) manager for Pine Script drawing objects.
+    Implements a FIFO (First-In-First-Out) buffer strategy to maintain rendering performance 
+    within Pine Script's strict object limits (max_lines_count, max_boxes_count, etc.).
 
-// Global arrays for GC (Note: In libraries, we can't use 'var' for global state easily across multiple script executions, 
-// but for a library used by a single indicator, we can manage state within objects or pass arrays).
-// However, Pine Script libraries are stateless between executions unless we use UDTs to hold state.
-// A better approach for v6 library is to encapsulate the GC manager in a UDT.
+Symbol Legend:
+    Q : Queue/Buffer of drawing objects (Lines, Boxes, Labels)
+    L : Maximum capacity of the buffer (Limit)
+    x : Object to be added
+    N : Current size of the buffer
+    
+    Logic:
+    If N > L:
+        Delete Q[0] (Oldest)
+        Shift Q
+    Push x to Q
+"""
 
+// ==========================================================================
+// STEP 01: 数据结构定义 (Data Structure Definition)
+// ==========================================================================
+
+// step 1.1: 垃圾回收管理器 (Garbage Collection Manager)
+// --------------------------------------------------------------------------
 export type GCManager
-    array<line> lines
-    array<box> boxes
-    array<label> labels
-    int limit
+    array<line> lines    // Buffer for line objects
+    array<box> boxes     // Buffer for box objects
+    array<label> labels  // Buffer for label objects
+    int limit            // Capacity constraint L
 
+// ==========================================================================
+// STEP 02: 初始化与核心逻辑 (Initialization & Core Logic)
+// ==========================================================================
+
+// step 2.1: 初始化 (Initialization)
+// --------------------------------------------------------------------------
+// Args:
+//   this (GCManager): The manager instance.
+//   limit (int): Maximum number of objects to keep. Default: 400.
+// 
+// Math & Logic:
+//   Initialize empty queues Q_lines, Q_boxes, Q_labels.
+//   Set L = limit.
 export method init(GCManager this, int limit=400)
     this.lines := array.new_line()
     this.boxes := array.new_box()
     this.labels := array.new_label()
     this.limit := limit
 
+// step 2.2: 线条绘制与管理 (Line Drawing & GC)
+// --------------------------------------------------------------------------
+// Args:
+//   this (GCManager): Manager instance.
+//   x1, y1, x2, y2: Coordinates.
+//   xloc, color, width, style: Styling parameters.
+//
+// Returns:
+//   line: The created line object.
+//
+// Math & Logic:
+//   1. Create object l_new.
+//   2. Q_lines ← l_new.
+//   3. If |Q_lines| > L:
+//        delete(Q_lines[0])
+//        Q_lines.shift()
 export method drawLine(GCManager this, int x1, float y1, int x2, float y2, string xloc=xloc.bar_index, color color=color.blue, int width=1, string style=line.style_solid)
+    // step 2.2a) 创建对象 (Object Creation)
+    // Why: Instantiate visual element on chart.
     l = line.new(x1, y1, x2, y2, xloc=xloc, color=color, width=width, style=style)
+    
+    // step 2.2b) 队列管理 (Queue Management)
+    // Why: Enforce FIFO limit to prevent runtime errors.
+    // Logic: Push -> Check Size -> Pop Oldest
     this.lines.push(l)
     if this.lines.size() > this.limit
         line.delete(this.lines.shift())
     l
 
+// step 2.3: 矩形绘制与管理 (Box Drawing & GC)
+// --------------------------------------------------------------------------
+// Args:
+//   this (GCManager): Manager instance.
+//   l, t, r, b: Left, Top, Right, Bottom coordinates.
+//
+// Returns:
+//   box: The created box object.
 export method drawBox(GCManager this, int l, float t, int r, float b, string xloc=xloc.bar_index, color border=color.blue, color bg=color.new(color.blue, 90), string txt="", color txt_color=color.white)
+    // step 2.3a) 创建对象 (Object Creation)
     bx = box.new(l, t, r, b, xloc=xloc, border_color=border, bgcolor=bg, text=txt, text_color=txt_color, text_size=size.small, text_halign=text.align_right)
+    
+    // step 2.3b) 队列管理 (Queue Management)
     this.boxes.push(bx)
     if this.boxes.size() > this.limit
         box.delete(this.boxes.shift())
     bx
 
+// step 2.4: 标签绘制与管理 (Label Drawing & GC)
+// --------------------------------------------------------------------------
+// Args:
+//   this (GCManager): Manager instance.
+//   x, y, txt: Coordinates and text.
+//
+// Returns:
+//   label: The created label object.
 export method drawLabel(GCManager this, int x, float y, string txt, color color=color.blue, string style=label.style_label_up, color textcolor=color.white)
+    // step 2.4a) 创建对象 (Object Creation)
     lb = label.new(x, y, txt, xloc=xloc.bar_index, color=color, style=style, textcolor=textcolor, size=size.small)
+    
+    // step 2.4b) 队列管理 (Queue Management)
     this.labels.push(lb)
     if this.labels.size() > this.limit
         label.delete(this.labels.shift())

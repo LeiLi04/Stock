@@ -1,12 +1,29 @@
 //@version=6
 indicator("ChanLun Pro Strict v15", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
 
+"""
+Algorithm Summary:
+    A professional-grade implementation of ChanLun (Zen/Entanglement Theory) for market analysis.
+    Integrates Fractal Geometry (FenXing), Stroke (Bi), Segment (XianDuan), and Center (ZhongShu) 
+    structures to identify high-probability trend reversals and continuations.
+
+Symbol Legend:
+    K : Raw Candlestick Data {Open, High, Low, Close}
+    K': Normalized Candlestick (after Inclusion Processing)
+    S : Stroke Sequence {s_0, s_1, ...}
+    C : Center State {ZG, ZD, ...}
+    L : Signal Logic (C1, C2, C3)
+
+    Core Tensor Flow:
+    Raw OHLC -> [Inclusion] -> Normalized K -> [Fractal] -> Pivots -> [Stroke Gen] -> Strokes -> [Center Gen] -> Centers -> [Signal] -> Trade
+"""
+
 import ./libraries/ChanLunLib as cl
 import ./libraries/DrawingLib as dl
 
-// ==============================
-// 1. 设置菜单 (Settings)
-// ==============================
+// ==========================================================================
+// STEP 01: 参数配置 (Configuration & Hyperparameters)
+// ==========================================================================
 grpA = "1. 缠论结构 (Structure)"
 lrb = input.int(1, "分型左右K数", minval=1, group=grpA)
 minBarsStroke = input.int(4, "成笔最小跨度", minval=1, group=grpA)
@@ -60,9 +77,9 @@ useNeonCandles = input.bool(false, "强制覆盖K线颜色", group=grpCol)
 col_candle_up = input.color(color.lime, "涨K线", group=grpCol)
 col_candle_dn = input.color(color.red, "跌K线", group=grpCol)
 
-// ==============================
-// 2. 初始化 (Init)
-// ==============================
+// ==========================================================================
+// STEP 02: 系统初始化 (System Initialization)
+// ==========================================================================
 var gc = dl.GCManager.new()
 if barstate.isfirst
     gc.init(400)
@@ -71,12 +88,18 @@ var strokes = array.new<cl.Stroke>()
 var centerSt = cl.CenterState.new(false, na, na, na, na, 0, 0, 0)
 var segSt = cl.SegState.new(false, na, na, 0, na, na, na, na, na, 0)
 
-// ==============================
-// 3. 预处理 (Preprocessing)
-// ==============================
+// ==========================================================================
+// STEP 03: 数据预处理 (Data Preprocessing)
+// ==========================================================================
+
+// step 3.1: 基础指标计算 (Basic Indicators)
+// --------------------------------------------------------------------------
 [macd, signal, hist] = ta.macd(close, 12, 26, 9)
 
-// Gaussian
+// step 3.2: 高斯通道 (Gaussian Channel)
+// --------------------------------------------------------------------------
+// Why: Used for volatility-based filtering of signals.
+// Math: Upper = EMA(Close) + k * EMA(TR)
 basis = ta.ema(close, gauss_len)
 volatility = ta.ema(ta.tr(true), gauss_len)
 upper_bound = basis + (gauss_mult * volatility)
@@ -86,7 +109,8 @@ if show_gaussian_bands
     p2 = plot(lower_bound, "Lower", color=color.green)
     fill(p1, p2, color=color.new(color.gray, 95))
 
-// MA & BB
+// step 3.3: 均线与布林带 (MA & BB)
+// --------------------------------------------------------------------------
 plot(showMA and show_ma1 ? ta.sma(close, ma1_len) : na, "MA1", color=color.yellow)
 plot(showMA and show_ma2 ? ta.sma(close, ma2_len) : na, "MA2", color=color.white)
 plot(showMA and show_ma3 ? ta.sma(close, ma3_len) : na, "MA3", color=color.aqua)
@@ -101,7 +125,12 @@ plot(showBB ? bb_mid : na, "BB Mid", color=color.new(color.orange, 80))
 // Neon Candles
 barcolor(useNeonCandles ? (close >= open ? col_candle_up : col_candle_dn) : na)
 
-// Inclusion (K线包含)
+// step 3.4: K线包含处理 (K-Line Inclusion)
+// --------------------------------------------------------------------------
+// Why: Remove noise by merging contained bars.
+// Math:
+//   If Up Trend: High' = max(H1, H2), Low' = max(L1, L2)
+//   If Down Trend: High' = min(H1, H2), Low' = min(L1, L2)
 var float nHigh = na, var float nLow = na, var int nDir = 0
 if na(nHigh)
     nHigh := high, nLow := low, nDir := close >= open ? 1 : -1
@@ -122,9 +151,12 @@ else
 plot(showInclusion ? nHigh : na, color=color.new(color.aqua, 50), title="NormHigh")
 plot(showInclusion ? nLow : na, color=color.new(color.fuchsia, 50), title="NormLow")
 
-// ==============================
-// 4. 笔生成 (Stroke Generation)
-// ==============================
+// ==========================================================================
+// STEP 04: 笔生成 (Stroke Generation)
+// ==========================================================================
+
+// step 4.1: 分型识别 (Fractal Detection)
+// --------------------------------------------------------------------------
 srcH = useNorm ? nHigh : high
 srcL = useNorm ? nLow : low
 ph = ta.pivothigh(srcH, lrb, lrb)
@@ -134,6 +166,8 @@ var int lastPivotIndex = na
 var float lastPivotPrice = na
 var int lastPivotType = 0 // 0:None, 1:High, 2:Low
 
+// step 4.2: 笔构造函数 (Stroke Constructor)
+// --------------------------------------------------------------------------
 makeStroke(_hasPivot, _isHigh, _idx, _price) =>
     bool created = false
     int curType = _isHigh ? 1 : 2
@@ -168,6 +202,8 @@ makeStroke(_hasPivot, _isHigh, _idx, _price) =>
 
     created
 
+// step 4.3: 分型处理逻辑 (Pivot Processing)
+// --------------------------------------------------------------------------
 bool evPH = not na(ph)
 bool evPL = not na(pl)
 int phIdx = evPH ? bar_index - lrb : na
@@ -189,16 +225,16 @@ if evPL
 
 var centers = array.new<cl.CenterState>()
 
-// ==============================
-// 5. 中枢 & 线段 (Centers & Segments)
-// ==============================
+// ==========================================================================
+// STEP 05: 中枢与线段 (Centers & Segments)
+// ==========================================================================
 if madePH or madePL
-    // Update Centers
-    int cStatus = centerSt.update(strokes)
+    // step 5.1: 中枢更新 (Center Update)
+    // ----------------------------------------------------------------------
+    int cStatus = centerSt.update(strokes, -1) // Note: lastCenterEndIdx not tracked here in main.pine simplified logic
     
     // Draw Center Box
     if centerSt.inCenter
-        // Logic to draw/update box
         if showCenter
             sStart = strokes.get(centerSt.startStr)
             sEnd = strokes.get(centerSt.lastStr)
@@ -208,24 +244,19 @@ if madePH or madePL
     if cStatus == 3 // Finished
         centers.push(centerSt.copy())
 
-    // Update Segments
+    // step 5.2: 线段更新 (Segment Update)
+    // ----------------------------------------------------------------------
     if segSt.update(strokes, minStrokesPerSeg)
         na
 
-    // Live Segment Drawing (Seamless)
+    // step 5.3: 实时线段绘制 (Live Segment Drawing)
+    // ----------------------------------------------------------------------
     var line liveSeg = line.new(na, na, na, na, width=segLineWidth)
     if showSegLines and segSt.inProgress
         sStart = strokes.get(segSt.startStr)
         sEnd = strokes.get(segSt.lastStr) // Connect to latest stroke tip
         
-        // Update live line
-        line.set_xy1(liveSeg, sStart.endIdx, sStart.endPx) // Start from previous segment end
-        // Note: For seamless, we should ideally track the exact end point of the previous segment.
-        // But sStart.endIdx is the end of the first stroke of the new segment? 
-        // No, sStart is the stroke at `startStr`.
-        // If `startStr` is the peak of the previous segment, then `sStart.endPx` (or startPx depending on dir) is the peak.
-        // Let's assume sStart.endIdx is close enough for now.
-        
+        line.set_xy1(liveSeg, sStart.endIdx, sStart.endPx) // Approx start
         line.set_xy1(liveSeg, sStart.startIdx, sStart.startPx)
         line.set_xy2(liveSeg, sEnd.endIdx, sEnd.endPx)
         line.set_color(liveSeg, segSt.dir > 0 ? col_seg_up : col_seg_dn)
@@ -233,9 +264,9 @@ if madePH or madePL
         line.set_xy1(liveSeg, na, na)
         line.set_xy2(liveSeg, na, na)
 
-// ==============================
-// 6. 信号 (Signals)
-// ==============================
+// ==========================================================================
+// STEP 06: 信号生成 (Signal Generation)
+// ==========================================================================
 var bool c1Buy = false
 var bool c1Sell = false
 var float c1BuyPx = na
@@ -248,14 +279,13 @@ var bool c3Sell = false
 if strokes.size() >= 2 and (madePH or madePL)
     curS = strokes.get(strokes.size() - 1)
     
-    // C1 Logic (Trend Reversal)
-    // ... (Already implemented)
-    // Buy: Down Stroke, New Low, MACD Divergence, Gaussian Filter
+    // step 6.1: C1 趋势背驰 (Trend Divergence)
+    // ----------------------------------------------------------------------
+    // Logic: New Low + MACD Divergence + Gaussian Filter
     if curS.dir == -1
         l0 = curS.get_low()
         // Check Divergence
         isDiv = false
-        // Simple Stroke Divergence
         if strokes.size() >= 3
             prevDownS = strokes.get(strokes.size() - 3)
             if l0 < prevDownS.get_low() and curS.macdHist > prevDownS.macdHist
@@ -271,7 +301,7 @@ if strokes.size() >= 2 and (madePH or madePL)
             if showSignalLabels
                 gc.drawLabel(curS.endIdx, l0, "C1 Buy", col_label_buy, label.style_label_up, col_text)
 
-    // Sell: Up Stroke, New High, MACD Divergence, Gaussian Filter
+    // Sell Logic
     if curS.dir == 1
         h0 = curS.get_high()
         isDiv = false
@@ -289,8 +319,8 @@ if strokes.size() >= 2 and (madePH or madePL)
             if showSignalLabels
                 gc.drawLabel(curS.endIdx, h0, "C1 Sell", col_label_sell, label.style_label_down, col_text)
 
-// C2 Logic (Second Confirmation)
-// ------------------------------
+// step 6.2: C2 次级别确认 (Second Confirmation)
+// --------------------------------------------------------------------------
 if c1Buy and not c2BuyTrig and strokes.size() > 0
     lastS = strokes.get(strokes.size() - 1)
     // Wait for a Down stroke that doesn't break C1 Low
@@ -310,36 +340,16 @@ if c1Sell and not c2SellTrig and strokes.size() > 0
             if showSignalLabels
                 gc.drawLabel(lastS.endIdx, lastS.endPx, "C2 Sell", col_label_sell, label.style_label_down, col_text)
 
-// C3 Logic (Trend Explosion)
-// --------------------------
+// step 6.3: C3 趋势爆发 (Trend Explosion)
+// --------------------------------------------------------------------------
 if strokes.size() > 0 and centers.size() > 0
     lastS = strokes.get(strokes.size() - 1)
     lastC = centers.get(centers.size() - 1)
     
     // C3 Buy: Rising Center (ori=1) + Pullback Low >= ZG
-    // We need to ensure we just left the center and pulled back.
-    // The center finished at `lastC.lastStr`.
-    // The stroke leaving the center is `lastC.lastStr + 1` (or `lastC.exitDir` stroke).
-    // The pullback stroke is `lastC.lastStr + 2`.
-    // So we check if `strokes.size() - 1` is the pullback stroke.
-    
-    // Check if last center was Up (Rising)
     if lastC.ori == 1
-        // We need a pullback (Down stroke)
         if lastS.dir == -1
-            // Check if this stroke is the first pullback after center?
-            // Center ended at `lastC.lastStr`. 
-            // Stroke `lastC.lastStr` was part of center.
-            // Stroke `lastC.lastStr + 1` was the exit stroke (Up).
-            // Stroke `lastC.lastStr + 2` is the pullback stroke (Down).
-            // So index should be `lastC.lastStr + 2`.
-            
-            // However, `lastC.lastStr` is an index in `strokes`.
-            // If `strokes.size() - 1 == lastC.lastStr + 2`
             if (strokes.size() - 1) == (lastC.lastStr + 2)
-                // Check if Pullback Low >= ZG (Strong) or ZD (Standard)?
-                // Whitepaper: "Low for Buy ... 绝对不触及中枢边界 (ZG/ZD)"
-                // Usually C3 Buy means Low > ZG (High of Center).
                 if lastS.get_low() > lastC.zg
                     c3Buy := true
                     if showSignalLabels
@@ -347,7 +357,6 @@ if strokes.size() > 0 and centers.size() > 0
 
     // C3 Sell: Falling Center (ori=-1) + Pullback High <= ZD
     if lastC.ori == -1
-        // We need a pullback (Up stroke)
         if lastS.dir == 1
             if (strokes.size() - 1) == (lastC.lastStr + 2)
                 if lastS.get_high() < lastC.zd
@@ -355,9 +364,9 @@ if strokes.size() > 0 and centers.size() > 0
                     if showSignalLabels
                         gc.drawLabel(lastS.endIdx, lastS.endPx, "C3 Sell", col_label_sell, label.style_label_down, col_text)
 
-// ==============================
-// 7. 交易执行 (Execution)
-// ==============================
+// ==========================================================================
+// STEP 07: 交易执行 (Execution)
+// ==========================================================================
 // Global Execution Variables
 var float g_long_entry = na
 var float g_long_sl    = na
@@ -366,7 +375,8 @@ var float g_short_entry = na
 var float g_short_sl    = na
 var int   g_short_stage = 0
 
-// Helper Functions for Execution
+// step 7.1: 执行辅助函数 (Execution Helpers)
+// --------------------------------------------------------------------------
 do_buy(_id, _sl, _riskPct) =>
     bool executed = false
     if strategy.position_size <= 0
@@ -395,15 +405,8 @@ do_sell(_id, _sl, _riskPct) =>
             executed := true
     executed
 
-// Execution Logic
-// We need to detect if a signal *just* happened. 
-// Our signal variables (c1Buy, etc.) are stateful flags.
-// We should reset them after execution or check if they were set *this bar*.
-// In the signal logic above, we set `c1Buy := true` when conditions are met.
-// We need to ensure we don't re-execute on the same bar if already executed?
-// Pine Script strategy executes on close.
-// We can use `stroke_updated` flag if we had it.
-// Let's check if `madePH` or `madePL` was true.
+// step 7.2: 信号触发 (Signal Trigger)
+// --------------------------------------------------------------------------
 bool stroke_updated = madePH or madePL
 
 if useC1ForEntry and stroke_updated
@@ -439,13 +442,7 @@ if stroke_updated
         c2SellTrig := false
 
     if c3Buy
-        // Use lastZG as SL? Or c1BuyPx?
-        // Whitepaper says C3 is pullback to ZG. SL should be below ZG or at ZG.
-        // Let's use lastZG if available, else c1BuyPx (fallback)
-        float sl_val = not na(centerSt.zg) ? centerSt.zg : c1BuyPx // Note: centerSt might be current center.
-        // If C3, we are outside center. centerSt might be invalid or new.
-        // We need the *confirmed* center's ZG.
-        // We stored it in `centers` array.
+        float sl_val = not na(centerSt.zg) ? centerSt.zg : c1BuyPx
         float lastZG = na
         if centers.size() > 0
             lastZG := centers.get(centers.size()-1).zg
@@ -470,7 +467,8 @@ if stroke_updated
             g_short_stage := 0
         c3Sell := false
 
-// Dynamic Stop Loss & Profit Taking (3-Stage)
+// step 7.3: 动态止盈止损 (Dynamic SL/TP)
+// --------------------------------------------------------------------------
 if strategy.position_size > 0 and not na(g_long_entry) and not na(g_long_sl)
     risk = g_long_entry - g_long_sl
     if high >= (g_long_entry + risk) and g_long_stage < 1
