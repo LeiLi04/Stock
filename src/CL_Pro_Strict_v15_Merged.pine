@@ -49,7 +49,7 @@ method drawLine(GCManager this, int x1, float y1, int x2, float y2, string xloc=
 // --------------------------------------------------------------------------
 method drawBox(GCManager this, int l, float t, int r, float b, string xloc=xloc.bar_index, color border=color.blue, color bg=na, string txt="", color txt_color=color.white) =>
     _bg = na(bg) ? color.new(color.blue, 90) : bg
-    bx = box.new(l, t, r, b, xloc=xloc, border_color=border, bgcolor=_bg, text=txt, text_color=txt_color, text_size=size.small, text_halign=text.align_right)
+    bx = box.new(l, t, r, b, xloc=xloc_, border_color=border, bgcolor=_bg, text=txt, text_color=txt_color, text_size=size.small, text_halign=text.align_right)
     this.boxes.push(bx)
     if this.boxes.size() > this.limit
         box.delete(this.boxes.shift())
@@ -92,7 +92,7 @@ type CenterState
     int ori          // Orientation: 1 (Rising), -1 (Falling), 0 (Neutral)
 
 method copy(CenterState this) =>
-    CenterState.new(this.inCenter, this.zg, this.zd, this.startStr, this.lastStr, this.enterDir, this.exitDir, this.ori)
+    CenterState.new(this.inCenter, this.zg, this.zd, this.startStr, this.lastStr, this.enterDir, this.exitDir, this.ori, this.segCount, this.level)
 
 // step 2.3: 线段状态 (Segment State)
 // --------------------------------------------------------------------------
@@ -167,15 +167,66 @@ method update(CenterState st, array<Stroke> strokes, int lastCenterEndIdx) =>
                 bool isDownCenter = (enterD == -1) and (d2 == 1) and (d1 == -1) and (d0 == 1)
                 bool isUpCenter   = (enterD == 1)  and (d2 == -1) and (d1 == 1)  and (d0 == -1)
                 
-                if (isDownCenter or isUpCenter) and (hi >= lo)
-                    st.zg := hi
-                    st.zd := lo
-                    st.inCenter := true
-                    st.startStr := sz - 3
-                    st.lastStr := sz - 1
-                    st.enterDir := enterD
-                    st.ori := 0
-                    status := 1
+                // 4. New Filters
+                // Height Filter
+                float boxHeight = hi - lo
+                bool passHeight = boxHeight >= minH * atrv
+
+                // Overlap Filter
+                bool passOverlap = true
+                if centers.size() > 0
+                    lastC = centers.get(centers.size()-1)
+                    float pZG = lastC.zg
+                    float pZD = lastC.zd
+                    float overlap = math.max(0.0, math.min(hi, pZG) - math.max(lo, pZD))
+                    float uni     = math.max(hi, pZG) - math.min(lo, pZD)
+                    float ratio   = uni > 0 ? overlap/uni : 0
+                    passOverlap := ratio <= maxOverlap
+                
+                // Lock Filter (Simplified: if useLock, require last center to be broken with trend i.e. ori!=0)
+                // Exception: First center (centers.size() == 0)
+                bool isLocked = useLock and centers.size() > 0 and st.ori == 0
+
+                if (isDownCenter or isUpCenter) and (hi >= lo) and passHeight and passOverlap and not isLocked
+                    // Try to merge with previous center
+                    bool merged = false
+                    if centers.size() > 0
+                        lastC = centers.get(centers.size() - 1)
+                        float prevZG = lastC.zg
+                        float prevZD = lastC.zd
+                        float interTop = math.min(prevZG, hi)
+                        float interBot = math.max(prevZD, lo)
+                        float interW = interTop - interBot
+                        float prevW = prevZG - prevZD
+                        float candW = hi - lo
+                        
+                        if interW > 0 and (interW / math.min(prevW, candW)) >= mergeRatio
+                            // Merge
+                            mergedZG = math.min(prevZG, hi)
+                            mergedZD = math.max(prevZD, lo)
+                            st.zg := mergedZG
+                            st.zd := mergedZD
+                            st.inCenter := true
+                            st.startStr := sz - 3
+                            st.lastStr := sz - 1
+                            st.enterDir := enterD
+                            st.ori := 0
+                            
+                            // Update previous stored center
+                            lastC.zg := mergedZG
+                            lastC.zd := mergedZD
+                            
+                            merged := true
+                        
+                    if not merged
+                        st.zg := hi
+                        st.zd := lo
+                        st.inCenter := true
+                        st.startStr := sz - 3
+                        st.lastStr := sz - 1
+                        st.enterDir := enterD
+                        st.ori := 0
+                        status := 1
         else
             // step 2.7c) 中枢延伸与破坏
             s = strokes.get(sz - 1)
@@ -292,6 +343,12 @@ lrb = input.int(1, "分型左右K数", minval=1, group=grpA)
 minBarsStroke = input.int(4, "成笔最小跨度", minval=1, group=grpA)
 useNorm = input.bool(true, "启用K线包含处理", group=grpA)
 minStrokesPerSeg = input.int(3, "线段最少包含笔数", minval=3, group=grpA)
+center_lock_until_break = input.bool(true,  "中枢锁：未破不新开", group=grpA)
+center_min_height_atr   = input.float(0.0, "中枢最小高度(ATR倍)", step=0.05, group=grpA)
+center_overlap_max_ratio= input.float(0.8, "与上个中枢重叠上限", step=0.05, group=grpA)
+center_merge_ratio = input.float(0.5, "中枢合并重叠阈值(占较窄者比例)", step=0.05, minval=0.0, maxval=1.0, group=grpA)
+use_segment_center = input.bool(true, "使用线段构建中枢 (Segment Centers)", group=grpA)
+relax_center_rule = input.bool(true, "放宽中枢进入判定", group=grpA)
 
 grpDisp = "2. 显示开关 (Display)"
 showInclusion   = input.bool(false, "显示包含处理K线", group=grpDisp)
@@ -353,7 +410,9 @@ if barstate.isfirst
     gc.init(400)
 
 var strokes = array.new<Stroke>()
-var centerSt = CenterState.new(false, na, na, na, na, 0, 0, 0)
+var segments = array.new<Segment>()
+var superSegments = array.new<Segment>()
+var centerSt = CenterState.new(false, na, na, na, na, 0, 0, 0, 0, 0)
 var segSt = SegState.new(false, na, na, 0, na, na, na, na, na, 0)
 
 // ==========================================================================
@@ -363,6 +422,9 @@ var segSt = SegState.new(false, na, na, 0, na, na, na, na, na, 0)
 // step 3.1: 基础指标计算 (Basic Indicators)
 // --------------------------------------------------------------------------
 [macd, signal, hist] = ta.macd(close, 12, 26, 9)
+atrv = ta.atr(20)
+var box activeCenterBox = na
+var line liveSeg = line.new(na, na, na, na, width=segLineWidth)
 
 // step 3.2: 高斯通道 (Gaussian Channel)
 // --------------------------------------------------------------------------
@@ -434,6 +496,7 @@ var float lastPivotPx = na
 var int lastPivotDir = 0 // 1: High, -1: Low
 
 bool newStrokeAdded = false
+var line liveStroke = line.new(na, na, na, na)
 
 // step 4.2: 笔生成逻辑 (Stroke Generation Logic)
 // --------------------------------------------------------------------------
@@ -495,13 +558,13 @@ if not na(pl)
             // Create Down Stroke
             s = Stroke.new(lastPivotIdx, lastPivotPx, idx, px, -1, 0, line(na))
             strokes.push(s)
-            strictStrokes.push(s)
+            // strictStrokes.push(s) // Avoid reference sharing if not needed
             newStrokeAdded := true
             
             // Update State
             lastPivotIdx := idx
             lastPivotPx := px
-            lastPivotDir := -1
+            lastPivotDir := dir
             
             // Draw
             if showStrokeLines
@@ -533,7 +596,6 @@ if not na(pl)
 
 var centers = array.new<CenterState>()
 var int lastCenterEndIdx = -1 // Track the last stroke index of the previous center
-
 if newStrokeAdded
     // step 5.1: 中枢更新 (Center Update)
     // ----------------------------------------------------------------------
