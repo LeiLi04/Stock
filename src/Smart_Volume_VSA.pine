@@ -1,19 +1,37 @@
 //@version=5
-indicator("Smart Volume VSA - Six Patterns (Refined)", shorttitle="Smart Vol VSA+", overlay=false, format=format.volume)
+// ======================================================================
+// Algorithm Summary: 基于六大量价形态 (2.1–2.6) 的 Smart Volume VSA 指标
+// Core Flow: 原始 OHLCV -> 趋势与位置判断 -> 六大量价形态 (state) -> 子类型细分 (subState) -> 图形标记 + Tooltip 解释
+// Symbol Legend:
+//   - C: Close, O: Open, H: High, L: Low, V: Volume
+//   - V_MA: Volume Moving Average
+//   - isBull/isBear: Long-term trend status
+//   - state: Main pattern ID (21-26)
+//   - subState: Sub-pattern ID (e.g., 221=Lock-in, 222=Exhaustion)
+// ======================================================================
+
+// Indicator: Smart Volume VSA+
+// Overlay: false (独立成交量窗口)
+indicator("Smart Volume VSA - Six Patterns (Refined)", shorttitle="Smart Vol VSA+", overlay=false, format=format.volume, max_labels_count=500)
 
 // =====================
 // 1. Inputs
 // =====================
+// group: Parameters - 基本量价判定阈值 (volume ratio, price eps)
 grp_param = "Parameters"
+// volHigh: 高量阈值, e.g. 1.5 表示成交量 > 1.5 × VolMA
 volLen    = input.int(20, "Volume MA Length", minval=1, group=grp_param, tooltip="Period for average volume calculation")
 volHigh   = input.float(1.5, "High Volume Threshold (xAvg)", minval=1.0, step=0.1, group=grp_param, tooltip="Multiplier for High Volume (e.g., > 1.5x Avg)")
 volLow    = input.float(0.7, "Low Volume Threshold (xAvg)", minval=0.1, step=0.1, group=grp_param, tooltip="Multiplier for Low Volume (e.g., < 0.7x Avg)")
+// priceEps: 价格涨跌最小幅度, 0.1% 表示 |ΔC| > 0.1% 才算涨/跌
 priceEps  = input.float(0.1, "Price Change Threshold (%)", minval=0.0, step=0.1, group=grp_param, tooltip="Minimum % change to consider Price Up/Down") / 100.0
 
+// group: Trend / Position - 用 MA20/MA50/MA200 判断趋势与高低位
 // 新增：趋势 & 位置参数
 trendGrp      = "Trend / Position"
 maShortLen    = input.int(20,  "短期趋势MA (Up-channel for 2.1)",   group=trendGrp, minval=1)
 maLongLen     = input.int(200, "长期趋势MA (Position / Bull-Bear)", group=trendGrp, minval=10)
+// distHighThr: 与长期均线的高位乖离, 0.1 ≈ 高 10%
 distHighThr   = input.float(0.1,  "高位乖离阈值 (Top, e.g. 10%)", group=trendGrp, step=0.01)
 distLowThr    = input.float(-0.1, "低位乖离阈值 (Bottom, e.g. -10%)", group=trendGrp, step=0.01)
 downDurLen    = input.int(20, "下跌持续期 (Selling Climax 参考)", group=trendGrp, minval=5)
@@ -21,20 +39,26 @@ downDurLen    = input.int(20, "下跌持续期 (Selling Climax 参考)", group=t
 // --- 专门给 2.4 用的趋势/回撤参数 ---
 maMidLen24       = input.int(50,  "2.4 中期MA (洗盘/阴跌)", group=trendGrp, minval=5)
 trendLen24       = input.int(10,  "2.4 趋势判断窗口",        group=trendGrp, minval=3)
+// pullbackMaxDrop: 洗盘最大回撤, e.g. 0.05 = 5%
 pullbackMaxDrop  = input.float(0.05, "2.4 洗盘最大回撤(相对近期高点)", step=0.01, group=trendGrp)
 driftMinDrop     = input.float(0.05, "2.4 阴跌最小回撤(相对近期高点)", step=0.01, group=trendGrp)
 
+// group: Range Filter - K线实体/振幅过滤
 // 新增：range 过滤
 rangeGrp      = "Range Filter"
-rangeEps      = input.float(0.01, "小波动阈值 Range/Close (%)", group=rangeGrp, step=0.001) // 1% 默认
+// rangeEps: 小波动阈值, e.g. 0.01 = 1%
+rangeEps      = input.float(0.01, "小波动阈值 Range/Close (e.g. 0.01=1%)", group=rangeGrp, step=0.001) // 1% 默认
 // rangeEps      := rangeEps  // 已经是小数百分比
 
+// group: 2.2 Lock-in vs Exhaustion - 锁仓与衰竭判定的特定参数
 // --- Extra params for 2.2 Lock-in vs Exhaustion ---
 grp_22 = "2.2 Lock-in vs Exhaustion"
 obvLen      = input.int(20,  "OBV MA Length",      minval=1, group=grp_22)
 peakLookback = input.int(50, "Near-Top Lookback",  minval=5, group=grp_22)
 peakProx    = input.float(0.03, "Near-Top Proximity (%)", step=0.005, group=grp_22)  // 3% 默认
 lockinRangeEps = input.float(0.02, "Lock-in Max Range/Close", step=0.005, group=grp_22)  // 锁仓K线波动<=2%
+
+showLabels = input.bool(true, "Show Pattern Labels & Tooltips", group="Visualization")
 
 grp_col = "Colors"
 col_21 = input.color(color.new(color.lime, 0),   "2.1 Vol Up + Price Up",    group=grp_col)
@@ -45,46 +69,64 @@ col_25 = input.color(color.new(color.red, 0),    "2.5 Vol Up + Price Down",  gro
 col_26 = input.color(color.new(color.red, 60),   "2.6 Vol Flat + Price Down",group=grp_col)
 col_default = input.color(color.new(color.gray, 60), "Default / Other",       group=grp_col)
 
-// =====================
-// 2. Volume Definitions
-// =====================
+// ======================================================================
+// STEP 01: 基础量价计算 (Base Price/Volume Metrics)
+// ======================================================================
+
+// ----------------------------------------------------------------------
+// step 1.1: Volume Definitions
+// ----------------------------------------------------------------------
+// Maths: V_ratio = Vₜ / MA(V, N)
 volMA    = ta.sma(volume, volLen)
 volRatio = volume / volMA
 
+// Logic: isVolUp = V_ratio ≥ volHigh
 isVolUp   = volRatio >= volHigh
 isVolDown = volRatio <= volLow
 isVolFlat = not isVolUp and not isVolDown
 
-// =====================
-// 3. Price Definitions
-// =====================
+// ----------------------------------------------------------------------
+// step 1.2: Price Definitions
+// ----------------------------------------------------------------------
+// Maths: ret = (Cₜ - Cₜ₋₁) / Cₜ₋₁
 ret = (close - close[1]) / close[1]
 
+// Logic: isPriceUp = ret > priceEps
 isPriceUp   = ret > priceEps
 isPriceDown = ret < -priceEps
 isPriceFlat = not isPriceUp and not isPriceDown
 
 // 新增：波动率 / range
+// Maths: rangePct = (H - L) / C
 barRange   = high - low
 rangePct   = barRange / close
 isRangeSmall = rangePct < rangeEps
 
-// =====================
-// 4. Trend & Position
-// =====================
+// ======================================================================
+// STEP 02: 趋势与位置判定 (Trend & Position)
+// ======================================================================
+
+// ----------------------------------------------------------------------
+// step 2.1: Moving Averages & Deviation
+// ----------------------------------------------------------------------
 maShort = ta.sma(close, maShortLen)
 maLong  = ta.sma(close, maLongLen)
 
+// Maths: dist200 = (C - MA200) / MA200
 dist200 = (close - maLong) / maLong
 
 // 短期上升通道：当前价在短期均线之上
 isShortUp = close > maShort
 
-// 大级别牛 / 熊
+// ----------------------------------------------------------------------
+// step 2.2: Bull/Bear & High/Low Zone
+// ----------------------------------------------------------------------
+// Logic: Bull = (C > MA200) ∧ (MA200 > MA200[1])
 isBull = close > maLong and maLong > maLong[1]        // 价格在长期均线上方 & MA向上
 isBear = close < maLong and maLong < maLong[1]        // 价格在长期均线下方 & MA向下
 
 // 高位 / 低位 判定（相对200MA的乖离）
+// Logic: HighZone = dist200 > distHighThr
 isHighZone = dist200 >  distHighThr
 isLowZone  = dist200 <  distLowThr
 
@@ -93,35 +135,71 @@ lowestN  = ta.lowest(close, downDurLen)
 highestN = ta.highest(close, downDurLen)
 hasBeenFalling = close < highestN and close <= close[downDurLen - 1]
 
+// ----------------------------------------------------------------------
+// step 2.3: OBV Calculation
+// ----------------------------------------------------------------------
 // --- OBV for 2.2 classification ---
 // Granville: OBV 上升、与价格同向 = 量价确认；OBV 不跟 = 衰竭 / 背离
+// Maths: OBVₜ = OBVₜ₋₁ + sign(ΔCₜ) ⊙ Vₜ
 obvChange = close > close[1] ? volume : close < close[1] ? -volume : 0.0
 obv   = ta.cum(obvChange)
 obvMA = ta.sma(obv, obvLen)
 
+// Logic: isObvUp = (OBV > MA) ∧ (OBV > OBV[1])
 isObvUp   = obv > obvMA and obv > obv[1]   // OBV 上升：有持续买盘/吸筹
 isObvWeak = obv <= obvMA or obv <= obv[1]  // OBV 走弱或横盘：量价背离风险
 
+
 // --- Near-peak zone for exhaustion ---
 peakHigh   = ta.highest(close, peakLookback)
+// Logic: isNearPeak = (HighestN - C) / HighestN ≤ peakProx
 isNearPeak = (peakHigh - close) / peakHigh <= peakProx  // 当前价在 N 日高点附近（例如<3%）
 
-// =====================
-// 5. 六大基础形态（主分类）
-// =====================
+// === 百分比类数值 ===
 
+// 价格相对上一根收盘的涨跌幅（已经有 ret，其实就是它）
+priceChangePct = ret   // (close - close[1]) / close[1]
+
+// 价格振幅百分比（高低点振幅 / 收盘价），已经有 rangePct
+// rangePct = barRange / close // 之前已经定义过
+
+// OBV 相对 OBV MA 的偏离百分比： (OBV - OBV_MA) / |OBV_MA|
+obvDevPct = obvMA != 0.0 ? (obv - obvMA) / math.abs(obvMA) : na
+
+// Vol 相对 Vol MA 的偏离百分比
+volDevPct = volMA != 0.0 ? (volume - volMA) / volMA : na
+
+// ======================================================================
+// STEP 03: 六大量价形态基础判定 (Six Basic Patterns)
+// ======================================================================
+
+// ----------------------------------------------------------------------
+// step 3.1: 2.1 量增价涨 (Vol Up + Price Up)
+// ----------------------------------------------------------------------
 // 2.1 量增价涨
 cond_21_base = isPriceUp and isVolUp
 // 细化：必须在短期上升通道中才标记为“健康齐升”
+// Logic: cond_21 = (ΔC > 0) ∧ (V_ratio ≥ volHigh) ∧ isShortUp
 cond_21 = cond_21_base and isShortUp
 
+// ----------------------------------------------------------------------
+// step 3.2: 2.2 量缩价涨 (Vol Down + Price Up)
+// ----------------------------------------------------------------------
 // 2.2 量缩价涨
+// Logic: cond_22 = (ΔC > 0) ∧ (V_ratio ≤ volLow)
 cond_22 = isPriceUp and isVolDown
 // 后续你可以用 isHighZone / isLowZone / isBull / isBear 进一步细分
 
+// ----------------------------------------------------------------------
+// step 3.3: 2.3 量增价平 (Vol Up + Price Flat)
+// ----------------------------------------------------------------------
 // 2.3 量增价平（需要价平 + 放量 + 小波动）
+// Logic: cond_23 = isPriceFlat ∧ isVolUp ∧ isRangeSmall
 cond_23 = isPriceFlat and isVolUp and isRangeSmall
 
+// ----------------------------------------------------------------------
+// step 3.4: 2.4 量缩价跌 (Vol Down + Price Down)
+// ----------------------------------------------------------------------
 // 2.4 量缩价跌
 cond_24 = isPriceDown and isVolDown
 
@@ -131,43 +209,67 @@ hh24          = ta.highest(close, trendLen24)
 dropFromHigh24 = (hh24 - close) / hh24
 
 // “洗盘环境”：价格在中期均线之上，中期均线在抬头，上涨趋势中的小回调
+// Logic: UpEnv = (C > MA50) ∧ (MA50 rising)
 isUpEnv24   = close > maMid24 and ta.rising(maMid24, trendLen24)
 
 // “阴跌环境”：价格在中期均线之下，中期均线在走低，下跌趋势中的持续回落
+// Logic: DownEnv = (C < MA50) ∧ (MA50 falling)
 isDownEnv24 = close < maMid24 and ta.falling(maMid24, trendLen24)
 
+// ----------------------------------------------------------------------
+// step 3.5: 2.5 量增价跌 (Vol Up + Price Down)
+// ----------------------------------------------------------------------
 // 2.5 量增价跌
+// Logic: cond_25 = (ΔC < 0) ∧ (V_ratio ≥ volHigh)
 cond_25 = isPriceDown and isVolUp
 
+// ----------------------------------------------------------------------
+// step 3.6: 2.6 量平价跌 (Vol Flat + Price Down)
+// ----------------------------------------------------------------------
 // 2.6 量平价跌
 cond_26 = isPriceDown and isVolFlat
 
+// ======================================================================
+// STEP 04: 子类型细分 (Sub-Pattern Classification)
+// ======================================================================
+
+// ----------------------------------------------------------------------
+// step 4.1: 2.2 Lock-in vs Exhaustion
+// ----------------------------------------------------------------------
 // --- 2.2 Sub-type: Lock-in vs Exhaustion ---
 // 锁仓 2.2-L：上升趋势中、非极端高位、OBV 同步走强、小波动
+// Why: 识别主力控盘拉升（Lock-in），区别于无量诱多
+// Logic: Lockin = cond_22 ∧ isBull ∧ ¬HighZone ∧ ¬NearPeak ∧ OBV_Up ∧ SmallRange
 is22Lockin = (
      cond_22 and                        // 本身就是 2.2
      isBull and                         // 大级别仍是多头
      not isHighZone and                 // 不在极端高位乖离区
+     not isNearPeak and                 // 也不在近期高点附近（避免与衰竭重叠）
      isObvUp and                        // OBV 继续抬升 = 聪明钱仍在吸筹/推升
      rangePct <= lockinRangeEps         // K线波动不大，更符合“控盘拉升”
      )
 
-// 衰竭 2.2-E：接近阶段高点，或大趋势走弱/转熊，且 OBV 不配合
+// 【敏感版】衰竭 2.2-E：高位/近高位 + OBV 不配合即可，不再强制趋势已转熊
+// Why: 识别多头动能枯竭（Exhaustion），No Demand
+// Logic: Exhaust = cond_22 ∧ (HighZone ∨ NearPeak) ∧ OBV_Weak
 is22Exhaust = (
      cond_22 and
      (
-         isHighZone or                  // 远离长期均线，高位区
-         isBear or not isBull           // 大级别趋势转弱/转熊
+         isHighZone              // 相对 200MA 高位乖离
+         or isNearPeak           // 或者至少在近期高点附近
      ) and
-     isNearPeak and                     // 接近 N 日高点
-     isObvWeak                          // OBV 不创新高，量价背离 = No Demand
+     isObvWeak                   // OBV 不创新高 / 走弱 = No Demand
      )
 
+// ----------------------------------------------------------------------
+// step 4.2: 2.4 Pullback vs Drift
+// ----------------------------------------------------------------------
 // --- 2.4: 洗盘 vs 阴跌（更严格版本） ---
 // 洗盘：
 //   1) 当前是 2.4（价跌量缩）
 //   2) 中期趋势向上（isUpEnv24）
 //   3) 只是离最近高点有“适度回撤”而已（<= pullbackMaxDrop）
+// Logic: Pullback = cond_24 ∧ UpEnv ∧ (Drop ≤ 5%)
 isPullback_24 = (
      cond_24 and
      isUpEnv24 and
@@ -178,10 +280,11 @@ isPullback_24 = (
 //   1) 当前是 2.4（价跌量缩）
 //   2) 中期趋势向下（isDownEnv24）
 //   3) 已经从近期高点“跌出一段距离”（>= driftMinDrop）
+// Logic: Drift = cond_24 ∧ DownEnv ∧ (Drop ≥ Max(5%, PullbackLimit))
 isDrift_24 = (
      cond_24 and
      isDownEnv24 and
-     dropFromHigh24 >= driftMinDrop
+     dropFromHigh24 >= math.max(driftMinDrop, pullbackMaxDrop) // 确保阴跌一定比洗盘更深
      )
 
 // =====================
@@ -190,45 +293,47 @@ isDrift_24 = (
 // 使用 subState / subTag 来表达更细的语义，不打乱原有 state 结构
 
 var int  subState = 0
-var string subTag  = ""
+// var string subTag  = ""
 
 // 缺省
 subState := 0
-subTag   := ""
+// subTag   := "" // Removed unused subTag logic
 
 // --- 2.2 Lock-in vs Exhaustion ---
 if is22Lockin
     subState := 221
-    subTag   := "锁仓2.2"
+    // subTag   := "锁仓2.2"
 else if is22Exhaust
     subState := 222
-    subTag   := "衰竭2.2"
+    // subTag   := "衰竭2.2"
 // --- 2.4: 洗盘 vs 阴跌 ---
 else if isPullback_24    // 多头中的缩量回调：洗盘
     subState := 241
-    subTag   := "洗盘"
+    // subTag   := "洗盘"
 else if isDrift_24    // 熊市中的缩量阴跌
     subState := 242
-    subTag   := "阴跌"
+    // subTag   := "阴跌"
 // --- 2.5: 顶部砸盘 vs Selling Climax ---
 else if cond_25 and isHighZone and not isBear      // 高位 + 放量跌 + 非明显熊市
     subState := 251
-    subTag   := "顶砸盘"
+    // subTag   := "顶砸盘"
 else if cond_25 and isLowZone and isBear and hasBeenFalling // 低位 + 长期下跌 + 放量跌
     subState := 252
-    subTag   := "Climax"
+    // subTag   := "Climax"
 // --- 2.6: 空头常态 vs 健康释放抛压 ---
 else if cond_26 and isBear        // 典型空头主跌段
     subState := 261
-    subTag   := "空头常态"
+    // subTag   := "空头常态"
 else if cond_26 and isBull        // 牛市中的健康释放抛压
     subState := 262
-    subTag   := "健康回调"
+    // subTag   := "健康回调"
 
-// =====================
-// 7. 主 state（与你原来一致）
-// =====================
+// ======================================================================
+// STEP 05: 状态优先级决策 (State Priority Logic)
+// ======================================================================
 // Priority: 2.5 > 2.3 > 2.1 > 2.2 > 2.4 > 2.6
+// Why: 优先标记极端行情（如放量暴跌 2.5），其次是典型趋势行情
+// Signal Flow: cond_XX -> state
 var int state = 0
 state := cond_25 ? 25 : 
          cond_23 ? 23 : 
@@ -237,10 +342,13 @@ state := cond_25 ? 25 :
          cond_24 ? 24 : 
          cond_26 ? 26 : 0
 
-// =====================
-// 8. Visualization
-// =====================
+// ======================================================================
+// STEP 06: 可视化输出 (Visualization)
+// ======================================================================
 
+// ----------------------------------------------------------------------
+// step 6.1: Volume Bars & Borders
+// ----------------------------------------------------------------------
 // 1) Base Volume
 baseColor = close >= open ? color.new(color.green, 50) : color.new(color.red, 50)
 
@@ -269,39 +377,176 @@ plot(volMA, "Volume MA", color=color.gray, linewidth=1)
 // 9. Labels
 // =====================
 
-// 原有顶 / 底标签（主形态）
-// Top Labels (UU, DU, UD)
-plotshape(state == 21, title="量增价涨", text="UU", location=location.top, style=shape.labelup,   color=col_21, textcolor=color.black, size=size.tiny)
+// ======================================================================
+// STEP 07: 标签与工具提示 (Labels & Tooltips)
+// ======================================================================
+// ----------------------------------------------------------------------
+// step 7.1: Tooltip Construction
+// ----------------------------------------------------------------------
 
-// 2.2 普通版：量缩价涨，但既不是明确锁仓，也不是明显衰竭
-plotshape(state == 22 and subState != 221 and subState != 222, title="量缩价涨-普通", text="DU", location=location.top, style=shape.labelup, color=col_22, textcolor=color.black, size=size.tiny)
+string tip   = ""
+string lblTxt = ""
 
-// 2.2 锁仓拉升：DU + “锁仓”直接写成一个标签
-plotshape(subState == 221, title="量缩价涨-锁仓", text="DU锁仓", location=location.top, style=shape.labelup, color=col_22, textcolor=color.black, size=size.tiny)
+// 构造各形态 tip
+if state == 21
+    lblTxt := "UU"
+    tip := "2.1 量增价涨（健康齐升）\n"
+    tip += "条件1 价格上涨: " + (isPriceUp ? "✅" : "❌") + "\n"
+    tip += "条件2 成交量放大: " + (isVolUp ? "✅" : "❌") + "\n"
+    tip += "条件3 短期上升通道 (isShortUp): " + (isShortUp ? "✅" : "❌")
 
-// 2.2 买盘衰竭：DU + “衰竭”
-plotshape(subState == 222, title="量缩价涨-衰竭", text="DU衰竭", location=location.top, style=shape.labelup, color=col_22, textcolor=color.black, size=size.tiny)
+else if state == 22
+    lblTxt := subState == 221 ? "DU锁仓" : subState == 222 ? "DU衰竭" : "DU"
+    tip := "2.2 量缩价涨"
 
-plotshape(state == 25, title="量增价跌", text="UD", location=location.top, style=shape.labelup,   color=col_25, textcolor=color.black, size=size.tiny)
+    if subState == 221
+        tip += "（锁仓拉升）\n"
+        tip += "条件1 价格上涨: " + (isPriceUp ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量缩小: " + (isVolDown ? "✅" : "❌") + "\n"
+        tip += "条件3 大级别多头 (isBull): " + (isBull ? "✅" : "❌") + "\n"
+        tip += "条件4 OBV 同步走强 (isObvUp): " + (isObvUp ? "✅" : "❌") + "\n"
+        tip += "条件5 单根波动小 (rangePct <= " + str.tostring(lockinRangeEps) + "): " + (rangePct <= lockinRangeEps ? "✅" : "❌")
+    else if subState == 222
+        tip += "（买盘衰竭）\n"
+        tip += "条件1 价格上涨: " + (isPriceUp ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量缩小: " + (isVolDown ? "✅" : "❌") + "\n"
+        tip += "条件3 高位/近阶段高点 (isHighZone or isNearPeak): " + ((isHighZone or isNearPeak) ? "✅" : "❌") + "\n"
+        tip += "条件4 OBV 走弱 (isObvWeak): " + (isObvWeak ? "✅" : "❌")
+    else
+        tip += "（普通型）\n"
+        tip += "条件1 价格上涨: " + (isPriceUp ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量缩小: " + (isVolDown ? "✅" : "❌")
 
-// Bottom Labels (DD, UE, ED)
-// Bottom Labels (DD, UE, ED)
-// 2.4 普通版
-plotshape(state == 24 and subState != 241 and subState != 242, title="量缩价跌-普通", text="DD", location=location.bottom, style=shape.labeldown, color=col_24, textcolor=color.white, size=size.tiny)
-// 2.4 洗盘
-plotshape(subState == 241, title="量缩价跌-洗盘", text="DD洗盘", location=location.bottom, style=shape.labeldown, color=col_24, textcolor=color.white, size=size.tiny)
-// 2.4 阴跌
-plotshape(subState == 242, title="量缩价跌-阴跌", text="DD阴跌", location=location.bottom, style=shape.labeldown, color=col_24, textcolor=color.white, size=size.tiny)
+else if state == 23
+    lblTxt := "UE"
+    tip := "2.3 量增价平（蓄势/分歧）\n"
+    tip += "条件1 价格走平: " + (isPriceFlat ? "✅" : "❌") + "\n"
+    tip += "条件2 成交量放大: " + (isVolUp ? "✅" : "❌") + "\n"
+    tip += "条件3 波动极小 (isRangeSmall): " + (isRangeSmall ? "✅" : "❌")
 
-plotshape(state == 23, title="量增价平", text="UE", location=location.bottom, style=shape.labeldown, color=col_23, textcolor=color.white, size=size.tiny)
-plotshape(state == 26, title="量平价跌", text="ED", location=location.bottom, style=shape.labeldown, color=col_26, textcolor=color.white, size=size.tiny)
+else if state == 24
+    lblTxt := subState == 241 ? "DD洗盘" : subState == 242 ? "DD阴跌" : "DD"
+    tip := "2.4 量缩价跌"
 
-// 新增：子类型小标签（只在有 subTag 时画）
-// plotshape 不支持动态文本，改用 label.new
-if subState != 0
-    // 2.2 和 2.4 的子标签已经集成到上面的 plotshape 中了，这里不需要再画
-    if subState != 221 and subState != 222 and subState != 241 and subState != 242
-        label.new(bar_index, 0, text=subTag, yloc=yloc.belowbar, color=color.new(color.black, 100), style=label.style_none, textcolor=color.gray, size=size.tiny)
+    if subState == 241
+        tip += "（洗盘）\n"
+        tip += "条件1 价格下跌: " + (isPriceDown ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量缩小: " + (isVolDown ? "✅" : "❌") + "\n"
+        tip += "条件3 中期趋势向上 (isUpEnv24): " + (isUpEnv24 ? "✅" : "❌") + "\n"
+        tip += "条件4 回撤幅度适中 (<= " + str.tostring(pullbackMaxDrop) + "): " + (dropFromHigh24 <= pullbackMaxDrop ? "✅" : "❌")
+    else if subState == 242
+        tip += "（阴跌）\n"
+        tip += "条件1 价格下跌: " + (isPriceDown ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量缩小: " + (isVolDown ? "✅" : "❌") + "\n"
+        tip += "条件3 中期趋势向下 (isDownEnv24): " + (isDownEnv24 ? "✅" : "❌") + "\n"
+        tip += "条件4 已跌出一段距离 (>= " + str.tostring(driftMinDrop) + "): " + (dropFromHigh24 >= driftMinDrop ? "✅" : "❌")
+    else
+        tip += "（普通型）\n"
+        tip += "条件1 价格下跌: " + (isPriceDown ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量缩小: " + (isVolDown ? "✅" : "❌")
+
+else if state == 25
+    lblTxt := subState == 251 ? "顶砸盘" : subState == 252 ? "Climax" : "UD"
+    tip := "2.5 量增价跌"
+
+    if subState == 251
+        tip += "（顶部砸盘）\n"
+        tip += "条件1 价格下跌: " + (isPriceDown ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量放大: " + (isVolUp ? "✅" : "❌") + "\n"
+        tip += "条件3 高位区 (isHighZone): " + (isHighZone ? "✅" : "❌") + "\n"
+        tip += "条件4 非明显熊市 (not isBear): " + (not isBear ? "✅" : "❌")
+    else if subState == 252
+        tip += "（恐慌抛售 Climax）\n"
+        tip += "条件1 价格下跌: " + (isPriceDown ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量放大: " + (isVolUp ? "✅" : "❌") + "\n"
+        tip += "条件3 低位区 (isLowZone): " + (isLowZone ? "✅" : "❌") + "\n"
+        tip += "条件4 长期下跌趋势 (isBear & hasBeenFalling): " + ((isBear and hasBeenFalling) ? "✅" : "❌")
+    else
+        tip += "（普通型）\n"
+        tip += "条件1 价格下跌: " + (isPriceDown ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量放大: " + (isVolUp ? "✅" : "❌")
+
+else if state == 26
+    lblTxt := subState == 261 ? "空头常态" : subState == 262 ? "健康回调" : "ED"
+    tip := "2.6 量平价跌"
+
+    if subState == 261
+        tip += "（空头常态）\n"
+        tip += "条件1 价格下跌: " + (isPriceDown ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量持平: " + (isVolFlat ? "✅" : "❌") + "\n"
+        tip += "条件3 熊市趋势 (isBear): " + (isBear ? "✅" : "❌")
+    else if subState == 262
+        tip += "（健康回调）\n"
+        tip += "条件1 价格下跌: " + (isPriceDown ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量持平: " + (isVolFlat ? "✅" : "❌") + "\n"
+        tip += "条件3 牛市趋势 (isBull): " + (isBull ? "✅" : "❌")
+    else
+        tip += "（普通型）\n"
+        tip += "条件1 价格下跌: " + (isPriceDown ? "✅" : "❌") + "\n"
+        tip += "条件2 成交量持平: " + (isVolFlat ? "✅" : "❌")
+
+// === 通用信息区：追加到各形态 tip 后面 ===
+if state != 0
+    // 价格涨跌百分比格式化
+    string priceDir = priceChangePct > 0 ? "+" : ""
+    string priceChangeStr = na(priceChangePct) ? "NA" :
+         priceDir + str.tostring(priceChangePct * 100.0, "#.##") + "%"
+
+    // 振幅百分比
+    string rangeStr = na(rangePct) ? "NA" :
+         str.tostring(rangePct * 100.0, "#.##") + "%"
+
+
+
+    // OBV 相对 MA 的偏离百分比
+    string obvDevStr = na(obvDevPct) ? "NA" :
+         (obvDevPct > 0 ? "+" : "") + str.tostring(obvDevPct * 100.0, "#.##") + "%"
+
+    tip += "\n-------------------------"
+    tip += "\n价格涨跌: " + priceChangeStr + " [振幅(High-Low): " + rangeStr + "]"
+    tip += "\nOBV vs OBVMA(" + str.tostring(obvLen) + "): " + obvDevStr
+    
+    // Vol vs VolMA
+    string volDevStr = na(volDevPct) ? "NA" :
+         (volDevPct > 0 ? "+" : "") + str.tostring(volDevPct * 100.0, "#.##") + "%"
+    tip += "\nVol vs VolMA(" + str.tostring(volLen) + "): " + volDevStr
+
+// ----------------------------------------------------------------------
+// step 7.2: Label Drawing
+// ----------------------------------------------------------------------
+// 统一绘制 Label
+if showLabels and state != 0
+    bool isTop = state == 21 or state == 22 or state == 25
+    float y    = isTop ? volume : 0.0
+    string yl    = isTop ? yloc.price : yloc.price
+    color bg   = borderColor
+
+    color txtc = (state == 24 or state == 23 or state == 26) ? color.white : color.black
+    
+    // 对于 2.2 和 2.4，我们已经在 lblTxt 里区分了子类型文本，所以不需要额外的 label.new
+    // 但对于 2.5 和 2.6 的子类型，我们之前是用 subTag 单独画的，现在也可以整合进 lblTxt
+    // 为了保持兼容性，如果 lblTxt 已经包含了子类型信息（如 "DU锁仓"），就直接显示
+    
+    label.new(
+         bar_index, y,
+         text      = lblTxt,
+         xloc      = xloc.bar_index,
+         yloc      = yl,
+         style     = isTop ? label.style_label_up : label.style_label_down,
+         color     = bg,
+         textcolor = txtc,
+         size      = size.tiny,
+         tooltip   = tip)
+
+// 新增：子类型小标签（只在有 subTag 且 lblTxt 没覆盖时画）
+// 由于上面的重构，大部分 subTag 已经整合进 lblTxt 了，这里可以简化
+// 只有当 subTag 有值，且 lblTxt 是简写（如 "UD", "ED"）时才画 subTag
+// 但为了简单起见，且上面的逻辑已经覆盖了大部分情况，我们可以先注释掉旧的 subTag 绘制逻辑
+// 或者只保留那些没有被整合进去的特殊情况（目前看都整合了）
+
+// if subState != 0
+//     if subState != 221 and subState != 222 and subState != 241 and subState != 242
+//         label.new(bar_index, 0, text=subTag, yloc=yloc.belowbar, color=color.new(color.black, 100), style=label.style_none, textcolor=color.gray, size=size.tiny)
 
 // =====================
 // 10. Data Window
